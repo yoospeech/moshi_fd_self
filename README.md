@@ -33,9 +33,9 @@ a lexical token. No speaker BEGIN/END tokens are used.
 
 Training treats user Mimi tokens as an acoustic prompt and optimizes assistant
 text cross-entropy plus assistant Mimi codebook cross-entropy. User Mimi tokens
-are never audio targets. The reference inference path currently force-feeds
-user Mimi tokens and samples assistant text; assistant-audio autoregressive
-decoding is a separate inference step.
+are never audio targets. Offline inference force-feeds user Mimi tokens,
+autoregressively samples assistant text and audio, feeds generated assistant
+audio back into later Temporal frames, and decodes it to a WAV file.
 
 Each training batch mixes acoustic-conditioned and text-only examples. With
 the documented `--batch-size 4 --text-only-fraction 0.5`, every rank receives
@@ -245,6 +245,9 @@ infer_stt_continuation.py \
   --tail-seconds 10 \
   --text-temperature 0.7 \
   --text-top-k 25 \
+  --audio-temperature 0.8 \
+  --audio-top-k 250 \
+  --audio-output inference_outputs/0.wav \
   --output inference_outputs/0.json
 ```
 
@@ -253,7 +256,9 @@ then ignored. For mono user audio use `--user-channel 0`. `--tail-seconds 10`
 appends silence before Mimi encoding so the audio clock has time to emit a
 response.
 
-The output JSON contains only assistant continuation data:
+The command writes assistant continuation metadata to JSON and decoded
+assistant speech to WAV. The input can be a time-aligned stereo sample or a
+mono user recording; only `--user-channel` is encoded as the prompt.
 
 ```json
 {
@@ -271,8 +276,9 @@ New checkpoints record `text_context_mode: "moshi"`. Older dual-text/ASR
 checkpoints are rejected because their stream count, heads, and delay pattern
 are incompatible.
 
-Reference inference recomputes the full prefix at every 12.5 Hz frame. It is
-correct for this interleaving but slow; KV-cache streaming is not implemented.
+Reference inference recomputes the full prefix for every text token and Depth
+codebook at each 12.5 Hz frame. It preserves causal Moshi feedback but is slow;
+KV-cache streaming is not implemented.
 
 Run regression tests with:
 

@@ -14,7 +14,9 @@ from stt_continuation.dataset import DailyTalkDataset, TextAlignmentCollision
 from stt_continuation.model import (
     STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_multistream_loss,
 )
-from stt_continuation.inference import force_audio_sample_text, load_config
+from stt_continuation.inference import (
+    force_audio_sample_text, generate_assistant, load_config,
+)
 from stt_continuation.train import acoustic_prompt_mask, resolve_model_source
 
 
@@ -148,6 +150,14 @@ class ModelTests(unittest.TestCase):
             )
             model.forward_text = forward
             self.assertEqual(len(a), 8)
+            generated_text, generated_audio = generate_assistant(
+                model, audio[:, :, :3], cfg,
+                text_temperature=0, text_top_k=0,
+                audio_temperature=0, audio_top_k=0, greedy=True,
+            )
+            self.assertEqual(len(generated_text), 3)
+            self.assertEqual(generated_audio.shape, (1, 4, 3))
+            self.assertTrue((generated_audio >= 0).all())
             streams = torch.full((1, 9, 8 + max(cfg.delays)), -1, dtype=torch.long)
             streams[:, 0] = cfg.text_padding_id
             streams[0, 0, :8] = torch.tensor(a)

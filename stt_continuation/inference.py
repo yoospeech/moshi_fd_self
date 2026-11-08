@@ -39,8 +39,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tail-seconds", type=float, default=10.0)
     parser.add_argument("--text-temperature", type=float, default=0.7)
     parser.add_argument("--text-top-k", type=int, default=25)
+    parser.add_argument("--audio-temperature", type=float, default=0.8)
+    parser.add_argument("--audio-top-k", type=int, default=250)
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--output", default="inference_text.json")
+    parser.add_argument(
+        "--audio-output",
+        help="assistant WAV path; defaults to the JSON output with a .wav suffix",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -167,6 +173,79 @@ def force_audio_sample_text(
     return generated[0]
 
 
+@torch.inference_mode()
+def generate_assistant(
+    model: SmolLM2MoshiSTTContinuation,
+    user_audio_codes: torch.Tensor,
+    config: STTContinuationConfig,
+    *,
+    text_temperature: float,
+    text_top_k: int,
+    audio_temperature: float,
+    audio_top_k: int,
+    greedy: bool,
+) -> tuple[list[int], torch.Tensor]:
+    """Offline causal generation of assistant text and Mimi audio."""
+    if user_audio_codes.shape[:2] != (1, config.num_codebooks):
+        raise ValueError(
+            "user_audio_codes must have shape "
+            f"[1, {config.num_codebooks}, frames]"
+        )
+    device = model.device
+    user_audio_codes = user_audio_codes.to(device)
+    frames = user_audio_codes.shape[-1]
+    tail = max(config.delays)
+    streams = torch.full(
+        (1, model.num_codebooks, frames + tail),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+    streams[:, 0] = config.text_padding_id
+    streams[:, model.user_audio_offset :, :frames] = user_audio_codes
+    generated_text: list[int] = []
+
+    for frame_index in range(frames):
+        text_logits, _, _, _ = model.forward_training(streams, predict_audio=False)
+        text_token = sample_text(
+            text_logits[0, 0, frame_index],
+            temperature=text_temperature,
+            top_k=text_top_k,
+            greedy=greedy,
+        )
+        streams[0, 0, frame_index] = text_token
+        generated_text.append(text_token)
+
+        # Depth is autoregressive over codebooks at the current audio frame.
+        # Re-running the offline forward after each sampled codebook supplies
+        # the just-generated q(k-1) token to the q(k) Depth input.
+        for codebook in range(config.num_codebooks):
+            _, _, audio_logits, _ = model.forward_training(streams)
+            assert audio_logits is not None
+            audio_token = sample_text(
+                audio_logits[0, codebook, frame_index],
+                temperature=audio_temperature,
+                top_k=audio_top_k,
+                greedy=greedy,
+            )
+            streams[0, model.audio_offset + codebook, frame_index] = audio_token
+
+        if (
+            frame_index == 0
+            or (frame_index + 1) % 25 == 0
+            or frame_index + 1 == frames
+        ):
+            print(
+                f"generated assistant frame {frame_index + 1}/{frames}",
+                flush=True,
+            )
+
+    assistant_codes = streams[
+        :, model.audio_offset : model.user_audio_offset, :frames
+    ]
+    return generated_text, assistant_codes
+
+
 def render_tokens(
     token_ids: list[int], tokenizer: AutoTokenizer, config: STTContinuationConfig
 ) -> tuple[str, list[dict[str, object]]]:
@@ -240,14 +319,17 @@ def main() -> None:
     if tail_samples:
         waveform = torch.cat([waveform, torch.zeros(tail_samples)])
     audio_codes = mimi.encode(waveform[None, None].to(mimi_device))
-    continuation_token_ids = force_audio_sample_text(
+    continuation_token_ids, assistant_codes = generate_assistant(
         model,
         audio_codes,
         config,
-        temperature=args.text_temperature,
-        top_k=args.text_top_k,
+        text_temperature=args.text_temperature,
+        text_top_k=args.text_top_k,
+        audio_temperature=args.audio_temperature,
+        audio_top_k=args.audio_top_k,
         greedy=args.greedy,
     )
+    assistant_waveform = mimi.decode(assistant_codes.to(mimi_device))
     continuation_text, continuation_events = render_tokens(
         continuation_token_ids, tokenizer, config
     )
@@ -257,6 +339,8 @@ def main() -> None:
         "checkpoint_step": checkpoint_step,
         "stream_order": [
             "assistant_text",
+            "assistant_semantic",
+            *[f"assistant_acoustic_{index}" for index in range(1, config.num_codebooks)],
             "user_semantic",
             *[f"user_acoustic_{index}" for index in range(1, config.num_codebooks)],
         ],
@@ -265,6 +349,8 @@ def main() -> None:
             "greedy": args.greedy,
             "temperature": args.text_temperature,
             "top_k": args.text_top_k,
+            "audio_temperature": args.audio_temperature,
+            "audio_top_k": args.audio_top_k,
             "seed": args.seed,
         },
         "continuation_text": continuation_text,
@@ -292,9 +378,17 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    audio_output = Path(args.audio_output) if args.audio_output else output.with_suffix(".wav")
+    audio_output.parent.mkdir(parents=True, exist_ok=True)
+    sphn.write_wav(
+        audio_output,
+        assistant_waveform[0, 0].float().clamp(-1, 1).cpu().numpy(),
+        mimi.sample_rate,
+    )
     print("\nASSISTANT CONTINUATION")
     print(continuation_text or "(empty)")
     print(f"saved {output}")
+    print(f"saved {audio_output}")
 
 
 if __name__ == "__main__":

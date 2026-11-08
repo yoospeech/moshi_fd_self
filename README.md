@@ -261,6 +261,10 @@ assistant_audio         assistant Mimi codebook loss (only when audio loss weigh
 assistant_np_accuracy   assistant lexical/EPAD accuracy excluding PAD
 assistant_all_accuracy  assistant accuracy including PAD frames
 audio_acc               mean assistant Mimi codebook accuracy (only when audio loss weight > 0)
+assistant_rq_accuracy_1  assistant Mimi RQ1/semantic-codebook accuracy
+assistant_rq_accuracy_2  assistant Mimi RQ2 accuracy
+assistant_rq_accuracy_3  assistant Mimi RQ3 accuracy
+assistant_rq_accuracy_4  assistant Mimi RQ4 accuracy
 ```
 
 PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use

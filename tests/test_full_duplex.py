@@ -224,6 +224,8 @@ class ModelTests(unittest.TestCase):
             )
             torch.testing.assert_close(loss, same_loss)
             self.assertFalse(any('user_audio' in key for key in metrics))
+            for rq in range(1, 5):
+                self.assertIn(f"assistant_rq_accuracy_{rq}", metrics)
             # Future feedback must not alter earlier temporal predictions.
             future_streams = streams.clone()
             future_streams[:, 1:5, 4:] = 0

@@ -322,7 +322,9 @@ def masked_multistream_loss(
             )
             accuracies.append(accuracy)
             metrics[f"assistant_audio/rq/{codebook}_loss"] = codebook_loss.detach()
-            metrics[f"assistant_audio/rq/{codebook}_accuracy"] = accuracy.detach()
+            # Use human-facing RQ numbers (1..N) consistently in CLI and
+            # TensorBoard instead of Python's zero-based codebook index.
+            metrics[f"assistant_rq_accuracy_{codebook + 1}"] = accuracy.detach()
         weights = audio_logits.new_ones(len(per_codebook), dtype=torch.float32)
         weights[0] = semantic_loss_weight
         audio_loss = (torch.stack(per_codebook) * weights).sum() / weights.sum()

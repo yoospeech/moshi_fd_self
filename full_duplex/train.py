@@ -587,12 +587,18 @@ def run_training() -> None:
                     f"assistant_audio={metrics['loss/assistant_audio'].item():.4f} "
                     if "loss/assistant_audio" in metrics else ""
                 )
+                rq_log = " ".join(
+                    f"assistant_rq_accuracy_{rq}={metrics[f'assistant_rq_accuracy_{rq}'].item():.3f}"
+                    for rq in range(1, config.num_codebooks + 1)
+                    if f"assistant_rq_accuracy_{rq}" in metrics
+                )
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
                     f"{audio_log}"
                     f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
-                    f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f}",
+                    f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f} "
+                    f"{rq_log}",
                     flush=True,
                 )
             if primary and not args.smoke_test and step % args.save_every == 0:
@@ -617,11 +623,16 @@ def run_training() -> None:
                     f"audio_acc={valid_metrics['assistant_audio/accuracy']:.3f}"
                     if "assistant_audio/accuracy" in valid_metrics else ""
                 )
+                rq_log = " ".join(
+                    f"assistant_rq_accuracy_{rq}={valid_metrics[f'assistant_rq_accuracy_{rq}']:.3f}"
+                    for rq in range(1, config.num_codebooks + 1)
+                    if f"assistant_rq_accuracy_{rq}" in valid_metrics
+                )
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
                     f"assistant_np_accuracy={valid_metrics['assistant/non_pad_accuracy']:.3f} "
                     f"assistant_all_accuracy={valid_metrics['assistant/accuracy']:.3f} "
-                    f"{audio_log}",
+                    f"{audio_log} {rq_log}",
                     flush=True,
                 )
             if validate:

@@ -129,7 +129,7 @@ and DailyTalk manifest on this machine. Run it directly with one Python process;
 do not set `--nproc_per_node=2` when only one GPU is visible.
 
 ```bash
-cd /home/ysw/Documents/eee/moshi_asr_self
+cd /home/ysw/Documents/eee/moshi_fd_self
 
 CUDA_VISIBLE_DEVICES=0 \
 OMP_NUM_THREADS=4 \

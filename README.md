@@ -256,9 +256,14 @@ then ignored. For mono user audio use `--user-channel 0`. `--tail-seconds 10`
 appends silence before Mimi encoding so the audio clock has time to emit a
 response.
 
-The command writes assistant continuation metadata to JSON and decoded
-assistant speech to WAV. The input can be a time-aligned stereo sample or a
-mono user recording; only `--user-channel` is encoded as the prompt.
+The command writes assistant continuation metadata to JSON and a time-aligned
+stereo WAV: channel 0 is generated assistant speech, channel 1 is the selected
+original user waveform with the requested silence tail. For mono recordings
+use `--user-channel 0`. No transcript or timestamp sidecar is needed at inference.
+Generation runs on the delayed timeline, then undelays codebooks before Mimi
+decoding. Startup acoustic slots use INIT and final out-of-range slots are
+absent, matching training. Text EOS latches text to PAD; audio runs through the
+fixed input-plus-tail duration.
 
 ```json
 {
@@ -276,9 +281,10 @@ New checkpoints record `text_context_mode: "moshi"`. Older dual-text/ASR
 checkpoints are rejected because their stream count, heads, and delay pattern
 are incompatible.
 
-Reference inference recomputes the full prefix for every text token and Depth
-codebook at each 12.5 Hz frame. It preserves causal Moshi feedback but is slow;
-KV-cache streaming is not implemented.
+Reference inference recomputes the Temporal prefix once per delayed frame and
+the Depth prefix per codebook. KV-cache streaming is not implemented.
+Old text-only checkpoints do not have the extra audio embeddings required by
+this dual-audio architecture and cannot be loaded directly.
 
 Run regression tests with:
 

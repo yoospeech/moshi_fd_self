@@ -18,6 +18,7 @@ from stt_continuation.inference import (
     force_audio_sample_text, generate_assistant, load_config,
 )
 from stt_continuation.train import acoustic_prompt_mask, resolve_model_source
+from moshi.models.lm_utils import _delay_sequence
 
 
 class AlignmentTests(unittest.TestCase):
@@ -67,6 +68,20 @@ class AlignmentTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_moshi_interleaving_delay_for_both_audio_streams(self):
+        cfg = STTContinuationConfig(num_codebooks=4, acoustic_delay_steps=1)
+        self.assertEqual(cfg.delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
+        raw = torch.arange(9 * 4).view(1, 9, 4)
+        initial = torch.full((1, 9, 1), 99, dtype=torch.long)
+        delayed = _delay_sequence(cfg.delays, raw, initial)
+        for stream in (0, 1, 5):
+            torch.testing.assert_close(delayed[:, stream], raw[:, stream])
+        for stream in (2, 3, 4, 6, 7, 8):
+            self.assertEqual(delayed[0, stream, 0].item(), 99)
+            torch.testing.assert_close(
+                delayed[0, stream, 1:], raw[0, stream, :-1]
+            )
+
     def test_half_batch_is_text_only(self):
         torch.manual_seed(7)
         mask = acoustic_prompt_mask(4, 0.5, device="cpu")
@@ -158,6 +173,20 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(len(generated_text), 3)
             self.assertEqual(generated_audio.shape, (1, 4, 3))
             self.assertTrue((generated_audio >= 0).all())
+            # Replay generated raw streams through training: every greedy
+            # prediction must match, including delay startup and flush frames.
+            replay = torch.full((1, 9, 4), -1, dtype=torch.long)
+            replay[:, 0] = cfg.text_padding_id
+            replay[0, 0, :3] = torch.tensor(generated_text)
+            replay[:, 1:5, :3] = generated_audio
+            replay[:, 5:, :3] = audio[:, :, :3]
+            replay_text, _, replay_audio, _ = model.forward_training(replay)
+            torch.testing.assert_close(
+                replay_text[0, 0, :3].argmax(-1), torch.tensor(generated_text)
+            )
+            torch.testing.assert_close(
+                replay_audio[:, :, :3].argmax(-1), generated_audio
+            )
             streams = torch.full((1, 9, 8 + max(cfg.delays)), -1, dtype=torch.long)
             streams[:, 0] = cfg.text_padding_id
             streams[0, 0, :8] = torch.tensor(a)

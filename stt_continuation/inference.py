@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 
 from .model import STTContinuationConfig, SmolLM2MoshiSTTContinuation
 from moshi.models import loaders as moshi_loaders
+from moshi.models.lm_utils import _undelay_sequence
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="inference_text.json")
     parser.add_argument(
         "--audio-output",
-        help="assistant WAV path; defaults to the JSON output with a .wav suffix",
+        help="stereo WAV path (assistant ch0, user ch1); defaults to JSON path with .wav",
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -184,8 +185,9 @@ def generate_assistant(
     audio_temperature: float,
     audio_top_k: int,
     greedy: bool,
+    text_eos_id: int | None = None,
 ) -> tuple[list[int], torch.Tensor]:
-    """Offline causal generation of assistant text and Mimi audio."""
+    """Generate directly on Moshi's delayed V_s interleaving timeline."""
     if user_audio_codes.shape[:2] != (1, config.num_codebooks):
         raise ValueError(
             "user_audio_codes must have shape "
@@ -194,55 +196,105 @@ def generate_assistant(
     device = model.device
     user_audio_codes = user_audio_codes.to(device)
     frames = user_audio_codes.shape[-1]
-    tail = max(config.delays)
-    streams = torch.full(
-        (1, model.num_codebooks, frames + tail),
-        -1,
-        dtype=torch.long,
-        device=device,
-    )
-    streams[:, 0] = config.text_padding_id
-    streams[:, model.user_audio_offset :, :frames] = user_audio_codes
+    delayed_steps = frames + max(config.audio_delays)
+    pattern = model._get_initial_token()
     generated_text: list[int] = []
+    delayed_assistant: list[torch.Tensor] = []
+    text_finished = False
 
-    for frame_index in range(frames):
-        text_logits, _, _, _ = model.forward_training(streams, predict_audio=False)
-        text_token = sample_text(
-            text_logits[0, 0, frame_index],
-            temperature=text_temperature,
-            top_k=text_top_k,
-            greedy=greedy,
+    for step in range(delayed_steps):
+        temporal, text_logits = model.forward_text(pattern)
+        if text_finished or step >= frames:
+            text_token = config.text_padding_id
+        else:
+            text_token = sample_text(
+                text_logits[0, 0, -1],
+                temperature=text_temperature,
+                top_k=text_top_k,
+                greedy=greedy,
+            )
+        if step < frames:
+            generated_text.append(text_token)
+        text_finished = text_finished or (
+            text_eos_id is not None and text_token == text_eos_id
         )
-        streams[0, 0, frame_index] = text_token
-        generated_text.append(text_token)
 
-        # Depth is autoregressive over codebooks at the current audio frame.
-        # Re-running the offline forward after each sampled codebook supplies
-        # the just-generated q(k-1) token to the q(k) Depth input.
+        # Generate assistant codebooks in Depth order within the delayed V_s
+        # frame. Acoustic q>0 here represents raw frame (s - delay[q]).
+        assistant_tokens: list[int] = []
         for codebook in range(config.num_codebooks):
-            _, _, audio_logits, _ = model.forward_training(streams)
-            assert audio_logits is not None
+            source = step - config.audio_delays[codebook]
+            if source < 0:
+                assistant_tokens.append(model.initial_token_id)
+                continue
+            if source >= frames:
+                assistant_tokens.append(model.zero_token_id)
+                continue
+            depth_inputs = []
+            for depth_index in range(codebook + 1):
+                depth_temporal = model.depformer_in[depth_index](temporal[:, -1:])
+                if depth_index == 0:
+                    depth_token = model.depformer_text_emb(
+                        torch.tensor([[text_token]], device=device)
+                    )
+                else:
+                    depth_token = model.depformer_emb[depth_index - 1](
+                        torch.tensor(
+                            [[assistant_tokens[depth_index - 1]]], device=device
+                        )
+                    )
+                depth_inputs.append(depth_token + depth_temporal)
+            depth_input = torch.cat(depth_inputs, dim=1)
+            depth_output = model.depformer(depth_input)
+            audio_logits = model.linears[codebook](
+                model.depformer_norms[codebook](depth_output[:, codebook])
+            )
             audio_token = sample_text(
-                audio_logits[0, codebook, frame_index],
+                audio_logits[0],
                 temperature=audio_temperature,
                 top_k=audio_top_k,
                 greedy=greedy,
             )
-            streams[0, model.audio_offset + codebook, frame_index] = audio_token
+            assistant_tokens.append(audio_token)
+        assistant_frame = torch.tensor(
+            assistant_tokens, dtype=torch.long, device=device
+        ).view(1, config.num_codebooks, 1)
+        delayed_assistant.append(assistant_frame)
+
+        frame = torch.full(
+            (1, model.num_codebooks, 1),
+            model.zero_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        frame[:, 0, 0] = text_token
+        frame[:, model.audio_offset : model.user_audio_offset] = assistant_frame
+        for codebook, delay in enumerate(config.audio_delays):
+            source = step - delay
+            user_index = model.user_audio_offset + codebook
+            if 0 <= source < frames:
+                frame[:, user_index, 0] = user_audio_codes[:, codebook, source]
+            elif source < 0:
+                frame[:, user_index, 0] = model.initial_token_id
+        pattern = torch.cat([pattern, frame], dim=-1)
 
         if (
-            frame_index == 0
-            or (frame_index + 1) % 25 == 0
-            or frame_index + 1 == frames
+            step == 0
+            or (step + 1) % 25 == 0
+            or step + 1 == delayed_steps
         ):
             print(
-                f"generated assistant frame {frame_index + 1}/{frames}",
+                f"generated delayed frame {step + 1}/{delayed_steps}",
                 flush=True,
             )
 
-    assistant_codes = streams[
-        :, model.audio_offset : model.user_audio_offset, :frames
-    ]
+    assistant_delayed = torch.cat(delayed_assistant, dim=-1)
+    assistant_codes, assistant_mask = _undelay_sequence(
+        config.audio_delays, assistant_delayed, fill_value=0
+    )
+    assistant_codes = assistant_codes[:, :, :frames]
+    if not assistant_mask[:, :, :frames].all():
+        raise RuntimeError("assistant delayed stream did not cover the user timeline")
     return generated_text, assistant_codes
 
 
@@ -328,6 +380,7 @@ def main() -> None:
         audio_temperature=args.audio_temperature,
         audio_top_k=args.audio_top_k,
         greedy=args.greedy,
+        text_eos_id=tokenizer.eos_token_id,
     )
     assistant_waveform = mimi.decode(assistant_codes.to(mimi_device))
     continuation_text, continuation_events = render_tokens(
@@ -380,11 +433,15 @@ def main() -> None:
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     audio_output = Path(args.audio_output) if args.audio_output else output.with_suffix(".wav")
     audio_output.parent.mkdir(parents=True, exist_ok=True)
-    sphn.write_wav(
-        audio_output,
-        assistant_waveform[0, 0].float().clamp(-1, 1).cpu().numpy(),
-        mimi.sample_rate,
-    )
+    assistant_mono = assistant_waveform[0, 0].float().clamp(-1, 1).cpu()
+    target_samples = waveform.numel()
+    if assistant_mono.numel() < target_samples:
+        assistant_mono = torch.nn.functional.pad(
+            assistant_mono, (0, target_samples - assistant_mono.numel())
+        )
+    assistant_mono = assistant_mono[:target_samples]
+    stereo = torch.stack([assistant_mono, waveform[:target_samples]], dim=0)
+    sphn.write_wav(audio_output, stereo.numpy(), mimi.sample_rate)
     print("\nASSISTANT CONTINUATION")
     print(continuation_text or "(empty)")
     print(f"saved {output}")

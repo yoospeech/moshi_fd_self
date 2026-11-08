@@ -229,6 +229,9 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
         initial = self._get_initial_token().expand(batch, -1, -1)
+        # Construct Moshi's V_s interleaving for training: text and semantic
+        # streams stay at s, while assistant/user acoustic streams move to
+        # s + acoustic_delay. Inference generates this same delayed timeline.
         delayed = _delay_sequence(self.delays, streams, initial)
         delayed = torch.cat([initial, delayed], dim=2)
         temporal, text_logits = self.forward_text(delayed[:, :, :-1])

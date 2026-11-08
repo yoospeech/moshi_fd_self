@@ -31,6 +31,32 @@ Assistant word timestamps are converted to the original Moshi PAD/EPAD
 timeline. EPAD is placed immediately before a word unless that would overwrite
 a lexical token. No speaker BEGIN/END tokens are used.
 
+### Causal learning rhythm: PAD, audio context, then lexical text
+
+A useful way to understand the aligned sequence is `PAD -> audio context ->
+EPAD -> non-PAD text`. This is a recurring causal rhythm on the shared audio
+clock, not four separately scheduled training stages:
+
+```text
+time frame       t-2          t-1          t            t+1
+assistant text   PAD          EPAD         lexical      PAD / next token
+audio context    Mimi tokens  Mimi tokens  Mimi tokens  Mimi tokens
+```
+
+During silent or listening frames, PAD keeps the assistant text stream aligned
+with the continuously advancing Mimi audio streams. The Temporal Transformer
+therefore learns the acoustic state while the text target remains PAD. EPAD at
+the frame immediately before a word is a learned boundary signal that says a
+lexical token is about to begin. The following non-PAD token is then predicted
+from the causal history containing the user prompt, past assistant audio, PAD
+timing, and EPAD boundary. Assistant audio is predicted in parallel through the
+Depth Transformer and is fed back only as past context at later frames.
+
+Thus PAD is not merely ignored blank space: it teaches when not to emit text,
+EPAD teaches when speech/text emission is about to start, and non-PAD tokens
+teach what to say. User audio participates only in that conditioning history;
+it is never an optimization target.
+
 Training treats user Mimi tokens as an acoustic prompt and optimizes assistant
 text cross-entropy plus assistant Mimi codebook cross-entropy. User Mimi tokens
 are never audio targets. Offline inference force-feeds user Mimi tokens,

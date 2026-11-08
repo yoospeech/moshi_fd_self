@@ -32,6 +32,7 @@ class AlignmentTests(unittest.TestCase):
             manifest = root / "manifest.jsonl"
             manifest.write_text(json.dumps({
                 "path": "0.wav", "duration": 2, "user_channel": 0,
+                "assistant_channel": 1,
             }) + "\n")
             ds = DailyTalkDataset(
                 manifest, Tokenizer(), text_padding_id=10, text_epad_id=11,
@@ -42,6 +43,7 @@ class AlignmentTests(unittest.TestCase):
             with patch("stt_continuation.dataset.sphn.read", return_value=(audio, 24000)):
                 item = ds[0]
             self.assertTrue((item["waveform"] == 1).all())
+            self.assertTrue((item["assistant_waveform"] == 0).all())
             self.assertEqual(item["continuation_tokens"][10].item(), 2)
 
     def test_padding_and_collision(self):
@@ -96,7 +98,7 @@ class ModelTests(unittest.TestCase):
                 config=str(config_path),
                 model=None,
             )
-            self.assertEqual(load_config(args).delays, [0, 0, 1, 1, 1])
+            self.assertEqual(load_config(args).delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
             base["acoustic_delay_steps"] = 2
             config_path.write_text(json.dumps(base))
             with self.assertRaisesRegex(ValueError, "expected"):
@@ -118,17 +120,19 @@ class ModelTests(unittest.TestCase):
             )
             model = SmolLM2MoshiSTTContinuation(cfg, device="cpu", dtype=torch.float32)
             model.eval()
-            self.assertEqual(cfg.delays, [0, 0, 1, 1, 1])
-            causal_probe = torch.randint(0, 16, (1, 5, 12))
+            self.assertEqual(cfg.delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
+            causal_probe = torch.randint(0, 16, (1, 9, 12))
             with torch.no_grad():
-                reference = model.forward_training(causal_probe)[0]
+                reference = model.forward_training(
+                    causal_probe, predict_audio=False
+                )[0]
                 changed = causal_probe.clone()
                 changed[:, 1, 4] = (changed[:, 1, 4] + 1) % cfg.audio_card
-                current = model.forward_training(changed)[0]
+                current = model.forward_training(changed, predict_audio=False)[0]
                 self.assertTrue(torch.isfinite(current[:, 0, 4]).all())
                 changed = causal_probe.clone()
                 changed[:, 1:, 5:] = (changed[:, 1:, 5:] + 1) % cfg.audio_card
-                future = model.forward_training(changed)[0]
+                future = model.forward_training(changed, predict_audio=False)[0]
             audio = torch.randint(0, 16, (1, 4, 8))
             observed = []
             forward = model.forward_text
@@ -144,14 +148,24 @@ class ModelTests(unittest.TestCase):
             )
             model.forward_text = forward
             self.assertEqual(len(a), 8)
-            streams = torch.full((1, 5, 8 + max(cfg.delays)), -1, dtype=torch.long)
+            streams = torch.full((1, 9, 8 + max(cfg.delays)), -1, dtype=torch.long)
             streams[:, 0] = cfg.text_padding_id
             streams[0, 0, :8] = torch.tensor(a)
-            streams[:, 1:, :8] = audio
+            streams[:, 5:, :8] = audio
             logits, mask, audio_logits, audio_mask = model.forward_training(streams)
             for t in range(8):
                 self.assertTrue(mask[0, 0, t])
                 torch.testing.assert_close(logits[0, 0, t], observed[t][0, 0], atol=1e-5, rtol=1e-5)
+            # The reference inference has no assistant feedback. Test parity
+            # with identical inputs, then separately exercise audio training.
+            self.assertFalse(audio_mask.any())
+            empty_loss, empty_metrics = masked_multistream_loss(
+                logits, mask, streams, audio_logits=audio_logits, audio_mask=audio_mask,
+            )
+            self.assertTrue(torch.isfinite(empty_loss))
+            self.assertEqual(empty_metrics['loss/assistant_audio'].item(), 0)
+            streams[:, 1:5, :8] = torch.randint(0, 16, (1, 4, 8))
+            logits, mask, audio_logits, audio_mask = model.forward_training(streams)
             self.assertEqual(audio_logits.shape, (1, 4, streams.shape[-1], 16))
             self.assertTrue(audio_mask[:, :, :8].all())
             text_logits, text_mask, no_audio_logits, no_audio_mask = (
@@ -164,6 +178,21 @@ class ModelTests(unittest.TestCase):
             loss, before = masked_multistream_loss(
                 logits, mask, streams, audio_logits=audio_logits, audio_mask=audio_mask,
             )
+            user_changed = streams.clone()
+            user_changed[:, 5:] = 0
+            same_loss, metrics = masked_multistream_loss(
+                logits, mask, user_changed, audio_logits=audio_logits, audio_mask=audio_mask,
+            )
+            torch.testing.assert_close(loss, same_loss)
+            self.assertFalse(any('user_audio' in key for key in metrics))
+            # Future feedback must not alter earlier temporal predictions.
+            future_streams = streams.clone()
+            future_streams[:, 1:5, 4:] = 0
+            future_logits = model.forward_training(future_streams)[0]
+            torch.testing.assert_close(logits[:, :, :5], future_logits[:, :, :5])
+            self.assertGreater((logits - model.forward_training(
+                streams.clone().index_fill(1, torch.arange(1, 5), -1)
+            )[0]).abs().sum().item(), 0)
             changed = streams.clone()
             changed[:, 0] = (changed[:, 0] + 1) % cfg.text_card
             _, after = masked_multistream_loss(logits, mask, changed)

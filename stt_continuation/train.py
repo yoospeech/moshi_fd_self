@@ -109,8 +109,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depformer-layers", type=int, default=6)
     parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
     parser.add_argument(
-        "--audio-loss-weight", type=float, default=0.0,
-        help="auxiliary user-audio loss weight; 0 keeps audio as conditioning only",
+        "--audio-loss-weight", type=float, default=0.1,
+        help="assistant feedback-audio loss weight; 0 disables assistant audio prediction",
     )
     parser.add_argument("--text-loss-weight", type=float, default=1.0)
     parser.add_argument("--semantic-loss-weight", type=float, default=100.0)
@@ -170,12 +170,12 @@ def print_model_summary(
         f"context={config.context}"
     )
     print(
-        f"  inputs: text=1 audio={config.num_codebooks} card={config.audio_card} "
+        f"  inputs: text=1 assistant_audio={config.num_codebooks} user_audio={config.num_codebooks} card={config.audio_card} "
         f"delays={config.delays}"
     )
     objective = "assistant text"
     if config.audio_loss_weight > 0:
-        objective += " + user audio Depth Transformer"
+        objective += " + assistant feedback audio Depth Transformer"
     print(f"  objective: {objective}")
     for name, count in groups.items():
         print(f"  parameters/{name}: {count / 1e6:.2f}M")
@@ -202,7 +202,7 @@ def online_streams(
     config: STTContinuationConfig,
     acoustic_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Extract frozen Mimi codes and combine them with aligned text."""
+    """Build Moshi streams: assistant text/audio followed by user audio."""
     continuation_tokens = batch["continuation_tokens"].to(  # type: ignore[union-attr]
         device, non_blocking=True
     )
@@ -210,7 +210,11 @@ def online_streams(
     continuation_frame_lengths = batch["continuation_frame_lengths"].tolist()  # type: ignore[union-attr]
     mimi_device = next(mimi.parameters()).device
     waveforms = batch["waveforms"].to(mimi_device, non_blocking=True)  # type: ignore[union-attr]
-    audio_codes = mimi.encode(waveforms).to(device)
+    assistant_waveforms = batch["assistant_waveforms"].to(  # type: ignore[union-attr]
+        mimi_device, non_blocking=True
+    )
+    combined_codes = mimi.encode(torch.cat([waveforms, assistant_waveforms], dim=0)).to(device)
+    audio_codes, assistant_codes = combined_codes.chunk(2, dim=0)
     if audio_codes.shape[1] != config.num_codebooks:
         raise RuntimeError(
             f"Mimi returned {audio_codes.shape[1]} codebooks, expected {config.num_codebooks}"
@@ -221,7 +225,7 @@ def online_streams(
         audio_codes.shape[-1], max(continuation_frame_lengths)
     ) + tail
     streams = torch.full(
-        (audio_codes.shape[0], 1 + config.num_codebooks, total_frames),
+        (audio_codes.shape[0], 1 + 2 * config.num_codebooks, total_frames),
         -1,
         dtype=torch.long,
         device=device,
@@ -247,7 +251,13 @@ def online_streams(
             index, 0, continuation_frames : continuation_frames + tail
         ] = config.text_padding_id
         if acoustic_mask[index]:
-            streams[index, 1:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
+            valid_assistant_frames = min(audio_frames, assistant_codes.shape[-1])
+            streams[index, 1 : 1 + config.num_codebooks, :valid_assistant_frames] = assistant_codes[
+                index, :, :valid_assistant_frames
+            ]
+            streams[index, 1 + config.num_codebooks :, :valid_audio_frames] = audio_codes[
+                index, :, :valid_audio_frames
+            ]
     return streams
 
 
@@ -436,7 +446,10 @@ def run_training() -> None:
         audio = torch.randint(
             0, args.audio_card, (args.batch_size, args.num_codebooks, smoke_frames), device=device
         )
-        streams = torch.cat([text, audio], dim=1)
+        assistant_audio_targets = torch.randint(
+            0, args.audio_card, (args.batch_size, args.num_codebooks, smoke_frames), device=device
+        )
+        streams = torch.cat([text, assistant_audio_targets, audio], dim=1)
         batches = [{"streams": streams}]
         valid_loader = None
         target_steps = args.smoke_steps
@@ -523,7 +536,11 @@ def run_training() -> None:
             train_sampler.set_epoch(epoch)
         for batch in batches:
             if args.smoke_test:
-                streams = batch["streams"].to(device, non_blocking=True)
+                streams = batch["streams"].to(device, non_blocking=True).clone()
+                acoustic_mask = acoustic_prompt_mask(
+                    streams.shape[0], args.text_only_fraction, device=device
+                )
+                streams[~acoustic_mask, 1:] = -1
             else:
                 assert mimi is not None
                 # Keep a fixed ratio with random positions inside each batch:
@@ -534,7 +551,9 @@ def run_training() -> None:
                 acoustic_mask = acoustic_prompt_mask(
                     batch_count, args.text_only_fraction, device=device
                 )
-                streams = online_streams(batch, mimi, device, config, acoustic_mask)
+                streams = online_streams(
+                    batch, mimi, device, config, acoustic_mask
+                )
             autocast = (
                 torch.autocast(device_type="cuda", dtype=dtype)
                 if device.type == "cuda"
@@ -565,8 +584,8 @@ def run_training() -> None:
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
                 audio_log = (
-                    f"audio={metrics['loss/user_audio'].item():.4f} "
-                    if "loss/user_audio" in metrics else ""
+                    f"assistant_audio={metrics['loss/assistant_audio'].item():.4f} "
+                    if "loss/assistant_audio" in metrics else ""
                 )
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
@@ -595,8 +614,8 @@ def run_training() -> None:
                 for name, value in valid_metrics.items():
                     writer.add_scalar(f"valid/{name}", value, step)
                 audio_log = (
-                    f"audio_acc={valid_metrics['user_audio/accuracy']:.3f}"
-                    if "user_audio/accuracy" in valid_metrics else ""
+                    f"audio_acc={valid_metrics['assistant_audio/accuracy']:.3f}"
+                    if "assistant_audio/accuracy" in valid_metrics else ""
                 )
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "

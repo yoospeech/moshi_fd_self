@@ -63,7 +63,7 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
     elif args.model and "lfm3" in args.model.lower():
         values["trust_remote_code"] = True
     config = STTContinuationConfig(**values)
-    expected_delays = [0, 0] + [1] * (config.num_codebooks - 1)
+    expected_delays = [0] + ([0] + [1] * (config.num_codebooks - 1)) * 2
     if config.delays != expected_delays:
         raise ValueError(
             "Checkpoint delay pattern is incompatible with Moshi-style inference: "
@@ -142,18 +142,24 @@ def force_audio_sample_text(
                 frame[:, channel, 0] = token
                 generated[channel].append(token)
 
-        # Audio is never sampled. Each codebook is copied from the user Mimi
-        # codes at the source frame selected by Moshi's delay pattern.
+        # This text-only reference path does not synthesize assistant audio;
+        # its feedback stream remains absent. User audio is force-fed solely
+        # into the user-conditioning stream.
         for codebook in range(config.num_codebooks):
             delay = config.delays[codebook + model.audio_offset]
             source = step - delay
+            assistant_index = codebook + model.audio_offset
+            frame[:, assistant_index, 0] = (
+                model.initial_token_id if source < 0 else model.zero_token_id
+            )
+            user_index = codebook + model.user_audio_offset
             if 0 <= source < audio_codes.shape[-1]:
-                frame[:, codebook + model.audio_offset, 0] = audio_codes[:, codebook, source]
+                frame[:, user_index, 0] = audio_codes[:, codebook, source]
             elif source < 0:
-                frame[:, codebook + model.audio_offset, 0] = model.initial_token_id
+                frame[:, user_index, 0] = model.initial_token_id
             else:
                 # Match the absent-audio tail used by online_streams in training.
-                frame[:, codebook + model.audio_offset, 0] = model.zero_token_id
+                frame[:, user_index, 0] = model.zero_token_id
 
         pattern = torch.cat([pattern, frame], dim=-1)
         if step == 0 or (step + 1) % 25 == 0 or step + 1 == total_pattern_steps:

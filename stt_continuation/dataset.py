@@ -34,6 +34,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         text_padding_id: int,
         text_epad_id: int,
         user_channel: int = 1,
+        assistant_channel: int = 0,
         min_duration: float = 5.0,
         max_duration: float = 45.0,
         min_words: int = 5,
@@ -50,6 +51,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         self.text_padding_id = text_padding_id
         self.text_epad_id = text_epad_id
         self.user_channel = user_channel
+        self.assistant_channel = assistant_channel
         with self.manifest.open(encoding="utf-8") as handle:
             raw_entries = [json.loads(line) for line in handle if line.strip()]
         self.original_size = len(raw_entries)
@@ -181,13 +183,16 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             audio_path = self.root / audio_path
         wav, _ = sphn.read(audio_path, sample_rate=self.sample_rate)
         if wav.ndim == 1:
-            main = wav
-        else:
-            channel = int(entry.get("user_channel", self.user_channel))
+            raise ValueError(f"{audio_path}: feedback-audio training requires stereo audio")
+        user_channel = int(entry.get("user_channel", self.user_channel))
+        assistant_channel = int(entry.get("assistant_channel", self.assistant_channel))
+        if user_channel == assistant_channel:
+            raise ValueError(f"{audio_path}: user and assistant channels must differ")
+        for channel in (user_channel, assistant_channel):
             if not 0 <= channel < wav.shape[0]:
                 raise ValueError(f"{audio_path}: missing channel {channel}")
-            main = wav[channel]
-        waveform = torch.from_numpy(main).float().clamp(-1.0, 1.0)
+        waveform = torch.from_numpy(wav[user_channel]).float().clamp(-1.0, 1.0)
+        assistant_waveform = torch.from_numpy(wav[assistant_channel]).float().clamp(-1.0, 1.0)
         samples_per_frame = self.sample_rate / self.frame_rate
         frame_length = max(1, math.ceil(waveform.numel() / samples_per_frame))
         continuation_tokens = self._aligned_text_stream(
@@ -197,6 +202,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         return {
             "id": audio_path.stem,
             "waveform": waveform,
+            "assistant_waveform": assistant_waveform,
             "continuation_tokens": continuation_tokens,
             "audio_frame_length": frame_length,
             "continuation_frame_length": continuation_tokens.numel(),
@@ -207,17 +213,20 @@ def collate_dailytalk(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_samples = max(item["waveform"].numel() for item in batch)
     max_continuation_frames = max(item["continuation_frame_length"] for item in batch)
     waveforms = torch.zeros(len(batch), 1, max_samples, dtype=torch.float32)
+    assistant_waveforms = torch.zeros(len(batch), 1, max_samples, dtype=torch.float32)
     continuation_tokens = torch.full(
         (len(batch), max_continuation_frames), -1, dtype=torch.long
     )
     for index, item in enumerate(batch):
         sample_length = item["waveform"].numel()
         waveforms[index, 0, :sample_length] = item["waveform"]
+        assistant_waveforms[index, 0, :sample_length] = item["assistant_waveform"]
         continuation_tokens[index, : item["continuation_frame_length"]] = item[
             "continuation_tokens"
         ]
     return {
         "waveforms": waveforms,
+        "assistant_waveforms": assistant_waveforms,
         "continuation_tokens": continuation_tokens,
         "audio_frame_lengths": torch.tensor(
             [item["audio_frame_length"] for item in batch], dtype=torch.long

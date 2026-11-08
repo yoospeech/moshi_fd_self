@@ -36,7 +36,7 @@ class STTContinuationConfig:
     depformer_heads: int = 16
     depformer_layers: int = 6
     depformer_ffn_dim: int = 4096
-    audio_loss_weight: float = 0.0
+    audio_loss_weight: float = 0.1
     text_loss_weight: float = 1.0
     semantic_loss_weight: float = 100.0
     text_padding_weight: float = 0.5
@@ -49,14 +49,14 @@ class STTContinuationConfig:
 
     @property
     def delays(self) -> list[int]:
-        # Preserve Moshi's native ordering: its text stream first, followed by
-        # semantic and acoustic audio. User text lags semantic audio so its
-        # prediction can condition on the corresponding observed semantic token.
-        return [self.continuation_delay_steps, 0] + [
-            self.acoustic_delay_steps
-        ] * (
-            self.num_codebooks - 1
-        )
+        # Moshi ordering: assistant text, assistant audio, then user audio.
+        # Both Mimi streams use one semantic codebook followed by delayed
+        # acoustic codebooks.
+        return [self.continuation_delay_steps] + self.audio_delays * 2
+
+    @property
+    def audio_delays(self) -> list[int]:
+        return [0] + [self.acoustic_delay_steps] * (self.num_codebooks - 1)
 
 
 class SmolLM2MoshiSTTContinuation(LMModel):
@@ -73,6 +73,10 @@ class SmolLM2MoshiSTTContinuation(LMModel):
     @property
     def audio_offset(self) -> int:
         return self.num_text_streams
+
+    @property
+    def user_audio_offset(self) -> int:
+        return self.audio_offset + self.stt_continuation_config.num_codebooks
 
     def __init__(
         self,
@@ -97,7 +101,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         # Keep Moshi's native Temporal -> Depth Transformer training path.
         super().__init__(
             delays=config.delays,
-            n_q=config.num_codebooks,
+            n_q=config.num_codebooks * 2,
             dep_q=config.num_codebooks,
             card=config.audio_card,
             text_card=config.text_card,
@@ -185,10 +189,10 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         text_logits = self.text_linear(temporal_hidden)
         return temporal_hidden, text_logits.unsqueeze(1)
 
-    def forward_user_audio_training(
-        self, sequence: torch.Tensor, user_state: torch.Tensor
+    def forward_assistant_audio_training(
+        self, sequence: torch.Tensor, temporal_state: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict user Mimi codebooks with the Depth Transformer."""
+        """Predict assistant codebooks given past Temporal state and depth prefix."""
         assert self.depformer_text_emb is not None
         assert self.depformer_emb is not None
         assert self.depformer is not None
@@ -196,7 +200,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         inputs = []
         for codebook in range(self.dep_q):
             # moshi_tts uses one Temporal projection per Depth step.
-            temporal = self.depformer_in[codebook](user_state)
+            temporal = self.depformer_in[codebook](temporal_state)
             if codebook == 0:
                 token = self.depformer_text_emb(sequence[:, 0])
             else:
@@ -220,7 +224,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
     ]:
-        """Predict assistant text and, optionally, user Mimi audio."""
+        """Predict assistant text and optionally its separate Mimi targets."""
         batch, codebooks, _ = streams.shape
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
@@ -234,12 +238,16 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         text_mask &= streams[:, : self.num_text_streams] != self.zero_token_id
         if not predict_audio:
             return text_logits, text_mask, None, None
-
-        audio_logits = self.forward_user_audio_training(delayed[:, :, 1:], temporal)
-        audio_logits, audio_mask = _undelay_sequence(
-            self.delays[self.audio_offset:], audio_logits, fill_value=float("nan")
+        audio_logits = self.forward_assistant_audio_training(
+            delayed[:, :, 1:], temporal
         )
-        audio_mask &= streams[:, self.audio_offset:] != self.zero_token_id
+        audio_logits, audio_mask = _undelay_sequence(
+            self.stt_continuation_config.audio_delays,
+            audio_logits, fill_value=float("nan")
+        )
+        audio_mask &= streams[
+            :, self.audio_offset : self.user_audio_offset
+        ] != self.zero_token_id
         return text_logits, text_mask, audio_logits, audio_mask
 
 
@@ -256,7 +264,7 @@ def masked_multistream_loss(
     text_loss_weight: float = 1.0,
     semantic_loss_weight: float = 100.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute Moshi-style assistant text and user audio CE losses."""
+    """Compute assistant text and feedback-audio CE losses."""
     text_targets = streams[:, :1]
     channel_losses = []
     metrics: dict[str, torch.Tensor] = {}
@@ -293,25 +301,31 @@ def masked_multistream_loss(
     text_loss = torch.stack(channel_losses).mean()
     total = text_loss_weight * text_loss
     if audio_logits is not None and audio_mask is not None:
-        audio_targets = streams[:, 1:]
+        audio_targets = streams[:, 1 : 1 + audio_logits.shape[1]]
         per_codebook = []
         accuracies = []
         for codebook in range(audio_logits.shape[1]):
             mask = audio_mask[:, codebook]
             logits = audio_logits[:, codebook][mask].float()
             targets = audio_targets[:, codebook][mask]
-            codebook_loss = nn.functional.cross_entropy(logits, targets)
+            codebook_loss = (
+                nn.functional.cross_entropy(logits, targets)
+                if targets.numel() else logits.sum() * 0.0
+            )
             per_codebook.append(codebook_loss)
-            accuracy = (logits.argmax(dim=-1) == targets).float().mean()
+            accuracy = (
+                (logits.argmax(dim=-1) == targets).float().mean()
+                if targets.numel() else logits.new_zeros(())
+            )
             accuracies.append(accuracy)
-            metrics[f"user_audio/rq/{codebook}_loss"] = codebook_loss.detach()
-            metrics[f"user_audio/rq/{codebook}_accuracy"] = accuracy.detach()
+            metrics[f"assistant_audio/rq/{codebook}_loss"] = codebook_loss.detach()
+            metrics[f"assistant_audio/rq/{codebook}_accuracy"] = accuracy.detach()
         weights = audio_logits.new_ones(len(per_codebook), dtype=torch.float32)
         weights[0] = semantic_loss_weight
         audio_loss = (torch.stack(per_codebook) * weights).sum() / weights.sum()
         audio_accuracy = torch.stack(accuracies).mean()
         total = text_loss_weight * text_loss + audio_loss_weight * audio_loss
-        metrics["loss/user_audio"] = audio_loss.detach()
-        metrics["user_audio/accuracy"] = audio_accuracy.detach()
+        metrics["loss/assistant_audio"] = audio_loss.detach()
+        metrics["assistant_audio/accuracy"] = audio_accuracy.detach()
     metrics["loss/total"] = total.detach()
     return total, metrics

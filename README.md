@@ -122,6 +122,60 @@ train_stt_continuation.py \
   --output /tmp/moshi_continuation_smoke
 ```
 
+## Current machine: single-GPU LFM3-1.7B training
+
+The following command uses the local Conda environment, downloaded LFM3 model,
+and DailyTalk manifest on this machine. Run it directly with one Python process;
+do not set `--nproc_per_node=2` when only one GPU is visible.
+
+```bash
+cd /home/ysw/Documents/eee/moshi_asr_self
+
+CUDA_VISIBLE_DEVICES=0 \
+OMP_NUM_THREADS=4 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=thirdparty/moshi/moshi \
+/home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
+train_stt_continuation.py \
+  --manifest /home/ysw/Documents/eee/moshi-finetune/daily-talk-contiguous/dailytalk.jsonl \
+  --model models/LFM3-1.7B \
+  --model-download-root models \
+  --trust-remote-code \
+  --num-codebooks 4 \
+  --continuation-delay-steps 0 \
+  --acoustic-delay 1 \
+  --depformer-dim 1024 \
+  --depformer-heads 16 \
+  --depformer-layers 6 \
+  --depformer-ffn-dim 4096 \
+  --audio-loss-weight 0.1 \
+  --text-loss-weight 1.0 \
+  --semantic-loss-weight 100 \
+  --text-padding-weight 0.5 \
+  --batch-size 4 \
+  --text-only-fraction 0.5 \
+  --grad-accum 2 \
+  --steps 100000 \
+  --learning-rate 2e-4 \
+  --temporal-learning-rate 2e-5 \
+  --min-duration 5 \
+  --max-duration 200 \
+  --min-words 5 \
+  --min-words-per-second 0.5 \
+  --max-words-per-second 2.5 \
+  --valid-ratio 0.05 \
+  --valid-every 500 \
+  --valid-batches 20 \
+  --log-every 10 \
+  --save-every 500 \
+  --print-model \
+  --output runs/lfm3_1_7b_moshi_feedback
+```
+
+This gives an effective batch of `4 × accumulation 2 = 8`, split evenly
+between acoustic and text-only samples. If memory is insufficient, use
+`--batch-size 2 --grad-accum 4`; the effective batch remains 8.
+
 ## Two-GPU DDP training
 
 ```bash

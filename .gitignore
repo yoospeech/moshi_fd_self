@@ -10,7 +10,7 @@ venv/
 .env
 
 # Local model weights and downloaded checkpoints.
-models/
+models
 *.safetensors
 *.ckpt
 *.pth

@@ -2,38 +2,40 @@
 
 > Experimental research prototype.
 
-This project takes the user audio channel as input and predicts only the
-assistant continuation text. User ASR/user text is not an input, target, loss,
-or inference output.
+This project takes the user audio channel as a prompt and jointly predicts the
+assistant continuation text and assistant audio. User audio is conditioning
+only and is never an audio loss target.
 
 ```text
-stereo WAV --channel 1--> frozen Mimi --> user audio tokens
-                                             |
-assistant PAD/EPAD timeline -----------------+--> Temporal Transformer
-                                                    |-- assistant text head
-                                                    `-- Moshi Depth Transformer (training only)
+stereo WAV channel 1 --> frozen Mimi --> user audio conditioning stream
+stereo WAV channel 0 --> frozen Mimi --> assistant audio target stream
+assistant PAD/EPAD timeline ------------> Temporal Transformer
+                                             |-- assistant text head
+                                             `-- assistant audio Depth Transformer
 ```
 
 ## Streams and timing
 
 ```text
-streams: [assistant_text, user_semantic, user_acoustic_1, user_acoustic_2, user_acoustic_3]
-delays:  [0,              0,             1,               1,               1]
+streams: [assistant_text, assistant_audio(q0..q3), user_audio(q0..q3)]
+delays:  [0,              0,1,1,1,          0,1,1,1]
 ```
 
-Assistant text and user semantic audio are placed at the current 12.5 Hz
-frame. The three acoustic codebooks lag by one frame (80 ms), following
-Moshi's semantic/acoustic interleaving. There is no user text stream and no
-assistant audio stream.
+Assistant text and both semantic audio codebooks are placed at the current
+12.5 Hz frame. The three acoustic codebooks in each audio stream lag by one
+frame (80 ms), following Moshi's semantic/acoustic interleaving. Assistant
+audio is teacher-forced only through its causal past; its current frame is the
+Depth prediction target. User audio is prompt conditioning and has no loss.
 
 Assistant word timestamps are converted to the original Moshi PAD/EPAD
 timeline. EPAD is placed immediately before a word unless that would overwrite
 a lexical token. No speaker BEGIN/END tokens are used.
 
 Training treats user Mimi tokens as an acoustic prompt and optimizes assistant
-continuation text cross-entropy. User semantic/acoustic tokens are not training
-targets by default (`--audio-loss-weight 0`). Inference likewise force-feeds
-observed user Mimi tokens and samples only assistant text.
+text cross-entropy plus assistant Mimi codebook cross-entropy. User Mimi tokens
+are never audio targets. The reference inference path currently force-feeds
+user Mimi tokens and samples assistant text; assistant-audio autoregressive
+decoding is a separate inference step.
 
 Each training batch mixes acoustic-conditioned and text-only examples. With
 the documented `--batch-size 4 --text-only-fraction 0.5`, every rank receives
@@ -47,7 +49,7 @@ keep the pretrained text model active while adapting it to acoustic prompts.
 
 ```text
 stt_continuation/model.py       model, interleaving, Depth Transformer, losses
-stt_continuation/dataset.py     user audio and assistant PAD/EPAD target
+stt_continuation/dataset.py     stereo user prompt, assistant audio, and PAD/EPAD target
 stt_continuation/train.py       single-GPU/DDP training and validation
 stt_continuation/inference.py   force-fed user-audio inference
 train_stt_continuation.py       training CLI
@@ -143,7 +145,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --depformer-heads 16 \
   --depformer-layers 6 \
   --depformer-ffn-dim 4096 \
-  --audio-loss-weight 0.0 \
+  --audio-loss-weight 0.1 \
   --text-loss-weight 1.0 \
   --semantic-loss-weight 100 \
   --text-padding-weight 0.5 \
@@ -201,26 +203,26 @@ Mimi device can then be selected with `--mimi-device cuda:1`.
 ```text
 loss                    total optimized loss
 assistant_text          assistant continuation cross-entropy
-audio                   user Mimi codebook loss (only when audio loss weight > 0)
+assistant_audio         assistant Mimi codebook loss (only when audio loss weight > 0)
 assistant_np_accuracy   assistant lexical/EPAD accuracy excluding PAD
 assistant_all_accuracy  assistant accuracy including PAD frames
-audio_acc               mean Mimi codebook accuracy (only when audio loss weight > 0)
+audio_acc               mean assistant Mimi codebook accuracy (only when audio loss weight > 0)
 ```
 
 PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use
 `assistant_np_accuracy` to judge whether actual continuation tokens improve.
 `--text-padding-weight 0.5` gives each non-PAD target twice the loss weight
 of each PAD target; it changes optimization, not the reported accuracies.
-The documented objective is assistant text only:
+The documented default objective is joint assistant text and audio:
 
 ```text
-loss = 1.0 * assistant_text + 0.0 * audio
+loss = 1.0 * assistant_text + 0.1 * assistant_audio
 ```
 
-The audio streams still condition the acoustic half of each batch; setting
-`--audio-loss-weight 0` removes only the auxiliary user-audio prediction
-objective and skips its Depth/RQ forward pass. `--semantic-loss-weight` has no
-effect while the audio loss weight is zero.
+The user audio stream still conditions the acoustic half of each batch; setting
+`--audio-loss-weight 0` skips assistant audio prediction and its Depth forward
+pass while retaining user audio as conditioning. `--semantic-loss-weight`
+controls the first assistant codebook when audio loss is enabled.
 
 ```bash
 tensorboard --logdir runs/smollm2_135m_moshi_continuation/tensorboard
@@ -255,8 +257,8 @@ The output JSON contains only assistant continuation data:
 
 ```json
 {
-  "stream_order": ["assistant_text", "user_semantic", "user_acoustic_1", "user_acoustic_2", "user_acoustic_3"],
-  "delay_pattern": [0, 0, 1, 1, 1],
+  "stream_order": ["assistant_text", "assistant_audio_q0", "assistant_audio_q1", "assistant_audio_q2", "assistant_audio_q3", "user_audio_q0", "user_audio_q1", "user_audio_q2", "user_audio_q3"],
+  "delay_pattern": [0, 0, 1, 1, 1, 0, 1, 1, 1],
   "continuation_text": "Assistant response",
   "transcript": {"assistant_continuation": "Assistant response"},
   "channels": {"continuation": {"text": "Assistant response", "events": []}}

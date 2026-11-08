@@ -326,6 +326,7 @@ infer_full_duplex.py \
   --user-channel 1 \
   --device cuda \
   --mimi-device cuda:0 \
+  --disable-lfm3-triton \
   --tail-seconds 10 \
   --text-temperature 0.7 \
   --text-top-k 25 \
@@ -339,6 +340,10 @@ Add `--greedy` for deterministic argmax decoding; temperature and top-k are
 then ignored. For mono user audio use `--user-channel 0`. `--tail-seconds 10`
 appends silence before Mimi encoding so the audio clock has time to emit a
 response.
+
+On GB10 (`sm_121a`), use `--disable-lfm3-triton` when the Triton-bundled
+`ptxas` does not recognize the GPU target. This selects LFM3's equivalent
+PyTorch causal-convolution fallback and does not change checkpoint weights.
 
 The command writes assistant response metadata to JSON and a time-aligned
 stereo WAV: channel 0 is generated assistant speech, channel 1 is the selected

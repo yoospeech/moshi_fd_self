@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import json
 from dataclasses import fields
 from pathlib import Path
@@ -43,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-temperature", type=float, default=0.8)
     parser.add_argument("--audio-top-k", type=int, default=250)
     parser.add_argument("--greedy", action="store_true")
+    parser.add_argument(
+        "--disable-lfm3-triton",
+        action="store_true",
+        help="use LFM3's PyTorch convolution fallback (needed when bundled ptxas does not support the GPU)",
+    )
     parser.add_argument("--output", default="full_duplex_output.json")
     parser.add_argument(
         "--audio-output",
@@ -342,6 +348,12 @@ def main() -> None:
         trust_remote_code=config.trust_remote_code,
     )
     model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
+    if args.disable_lfm3_triton:
+        temporal_module = importlib.import_module(model.transformer.__class__.__module__)
+        if not hasattr(temporal_module, "can_use_lfm3_conv"):
+            raise RuntimeError("the temporal model does not expose the LFM3 Triton selector")
+        temporal_module.can_use_lfm3_conv = lambda _hidden, _weight: False
+        print("LFM3 Triton convolution disabled; using PyTorch fallback", flush=True)
     print(f"memory-mapping checkpoint {args.checkpoint}", flush=True)
     package = torch.load(
         args.checkpoint,
@@ -441,7 +453,7 @@ def main() -> None:
         )
     assistant_mono = assistant_mono[:target_samples]
     stereo = torch.stack([assistant_mono, waveform[:target_samples]], dim=0)
-    sphn.write_wav(audio_output, stereo.numpy(), mimi.sample_rate)
+    sphn.write_wav(audio_output, stereo.detach().cpu().numpy(), mimi.sample_rate)
     print("\nASSISTANT RESPONSE")
     print(assistant_text or "(empty)")
     print(f"saved {output}")

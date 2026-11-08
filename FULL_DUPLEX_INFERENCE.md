@@ -18,6 +18,7 @@ infer_full_duplex.py \
   --user-channel 1 \
   --device cuda \
   --mimi-device cuda:0 \
+  --disable-lfm3-triton \
   --tail-seconds 10 \
   --text-temperature 0.7 \
   --text-top-k 25 \
@@ -26,6 +27,10 @@ infer_full_duplex.py \
 
 The adjacent `config.json` is loaded automatically. Use `--model` only when
 the checkpoint's stored temporal-model path must be overridden.
+
+On GB10 (`sm_121a`), `--disable-lfm3-triton` uses LFM3's PyTorch
+causal-convolution fallback when the Triton-bundled `ptxas` is too old to
+recognize that GPU target.
 
 ## Greedy decoding
 

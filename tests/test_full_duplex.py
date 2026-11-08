@@ -10,14 +10,14 @@ from pathlib import Path
 import torch
 from transformers import LlamaConfig, LlamaModel
 
-from stt_continuation.dataset import DailyTalkDataset, TextAlignmentCollision
-from stt_continuation.model import (
-    STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_multistream_loss,
+from full_duplex.dataset import DailyTalkDataset, TextAlignmentCollision
+from full_duplex.model import (
+    FullDuplexConfig, MoshiFullDuplexModel, masked_multistream_loss,
 )
-from stt_continuation.inference import (
-    force_audio_sample_text, generate_assistant, load_config,
+from full_duplex.inference import (
+    generate_assistant_text, generate_assistant, load_config,
 )
-from stt_continuation.train import acoustic_prompt_mask, resolve_model_source
+from full_duplex.train import acoustic_prompt_mask, resolve_model_source
 from moshi.models.lm_utils import _delay_sequence
 
 
@@ -43,11 +43,11 @@ class AlignmentTests(unittest.TestCase):
                 min_speech_coverage=0, max_speech_coverage=1,
             )
             audio = torch.stack([torch.ones(48000), torch.zeros(48000)]).numpy()
-            with patch("stt_continuation.dataset.sphn.read", return_value=(audio, 24000)):
+            with patch("full_duplex.dataset.sphn.read", return_value=(audio, 24000)):
                 item = ds[0]
             self.assertTrue((item["waveform"] == 1).all())
             self.assertTrue((item["assistant_waveform"] == 0).all())
-            self.assertEqual(item["continuation_tokens"][10].item(), 2)
+            self.assertEqual(item["assistant_text_tokens"][10].item(), 2)
 
     def test_padding_and_collision(self):
         class Tokenizer:
@@ -69,7 +69,7 @@ class AlignmentTests(unittest.TestCase):
 
 class ModelTests(unittest.TestCase):
     def test_moshi_interleaving_delay_for_both_audio_streams(self):
-        cfg = STTContinuationConfig(num_codebooks=4, acoustic_delay_steps=1)
+        cfg = FullDuplexConfig(num_codebooks=4, acoustic_delay_steps=1)
         self.assertEqual(cfg.delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
         raw = torch.arange(9 * 4).view(1, 9, 4)
         initial = torch.full((1, 9, 1), 99, dtype=torch.long)
@@ -129,13 +129,13 @@ class ModelTests(unittest.TestCase):
                 num_hidden_layers=1, num_attention_heads=2,
                 num_key_value_heads=2,
             )).save_pretrained(directory)
-            cfg = STTContinuationConfig(
+            cfg = FullDuplexConfig(
                 temporal_model=directory, text_card=34,
                 text_padding_id=32, text_epad_id=33, audio_card=16,
                 depformer_dim=32, depformer_heads=4, depformer_layers=2,
                 depformer_ffn_dim=64,
             )
-            model = SmolLM2MoshiSTTContinuation(cfg, device="cpu", dtype=torch.float32)
+            model = MoshiFullDuplexModel(cfg, device="cpu", dtype=torch.float32)
             model.eval()
             self.assertEqual(cfg.delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
             causal_probe = torch.randint(0, 16, (1, 9, 12))
@@ -160,7 +160,7 @@ class ModelTests(unittest.TestCase):
                 return result
 
             model.forward_text = record
-            a = force_audio_sample_text(
+            a = generate_assistant_text(
                 model, audio, cfg, temperature=0, top_k=0, greedy=True,
             )
             model.forward_text = forward

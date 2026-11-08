@@ -1,4 +1,4 @@
-"""Audio-conditioned Hugging Face temporal model for STT continuation."""
+"""Audio-conditioned Hugging Face temporal model for full-duplex response generation."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from moshi.models.lm_utils import _delay_sequence, _undelay_sequence  # noqa: E4
 
 
 @dataclass
-class STTContinuationConfig:
+class FullDuplexConfig:
     temporal_model: str = "models/SmolLM2-135M"
     trust_remote_code: bool = False
     text_card: int = 49154
@@ -29,7 +29,7 @@ class STTContinuationConfig:
     context: int = 3000
     frame_rate: float = 12.5
     text_delay_seconds: float = 0.08
-    continuation_delay_steps: int = 0
+    assistant_text_delay_steps: int = 0
     text_context_mode: str = "moshi"
     acoustic_delay_steps: int = 1
     depformer_dim: int = 1024
@@ -52,14 +52,14 @@ class STTContinuationConfig:
         # Moshi ordering: assistant text, assistant audio, then user audio.
         # Both Mimi streams use one semantic codebook followed by delayed
         # acoustic codebooks.
-        return [self.continuation_delay_steps] + self.audio_delays * 2
+        return [self.assistant_text_delay_steps] + self.audio_delays * 2
 
     @property
     def audio_delays(self) -> list[int]:
         return [0] + [self.acoustic_delay_steps] * (self.num_codebooks - 1)
 
 
-class SmolLM2MoshiSTTContinuation(LMModel):
+class MoshiFullDuplexModel(LMModel):
     """Moshi-style assistant text conditioned on force-fed user Mimi audio."""
 
     @property
@@ -76,27 +76,27 @@ class SmolLM2MoshiSTTContinuation(LMModel):
 
     @property
     def user_audio_offset(self) -> int:
-        return self.audio_offset + self.stt_continuation_config.num_codebooks
+        return self.audio_offset + self.full_duplex_config.num_codebooks
 
     def __init__(
         self,
-        config: STTContinuationConfig,
+        config: FullDuplexConfig,
         *,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         if config.text_context_mode != "moshi":
             raise ValueError("This model requires Moshi-style text context")
-        if config.continuation_delay_steps != 0:
+        if config.assistant_text_delay_steps != 0:
             raise ValueError(
-                "continuation_delay_steps must be 0 for assistant inner-monologue"
+                "assistant_text_delay_steps must be 0 for assistant inner-monologue"
             )
         temporal_config = AutoConfig.from_pretrained(
             config.temporal_model,
             trust_remote_code=config.trust_remote_code,
         )
         dim = int(temporal_config.hidden_size)
-        self.stt_continuation_config = config
+        self.full_duplex_config = config
 
         # Keep Moshi's native Temporal -> Depth Transformer training path.
         super().__init__(
@@ -217,7 +217,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         return torch.stack(logits, dim=1)
 
     def checkpoint_metadata(self) -> dict[str, object]:
-        return asdict(self.stt_continuation_config)
+        return asdict(self.full_duplex_config)
 
     def forward_training(
         self, streams: torch.Tensor, *, predict_audio: bool = True
@@ -245,7 +245,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             delayed[:, :, 1:], temporal
         )
         audio_logits, audio_mask = _undelay_sequence(
-            self.stt_continuation_config.audio_delays,
+            self.full_duplex_config.audio_delays,
             audio_logits, fill_value=float("nan")
         )
         audio_mask &= streams[

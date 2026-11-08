@@ -1,4 +1,4 @@
-"""DailyTalk user audio and aligned assistant continuation targets."""
+"""DailyTalk user audio and aligned assistant response targets."""
 
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             audio_path = Path(entry["path"])
             if not audio_path.is_absolute():
                 audio_path = self.root / audio_path
-            # The assistant-side transcript is the continuation target, i.e.
+            # The assistant-side transcript is the response target, i.e.
             # the model's inner-monologue text stream.  The current sidecar
             # schema stores its timestamped words under ``alignments``.
             inner_monologue_alignments = json.loads(
@@ -136,7 +136,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
     def _aligned_text_stream(
         self, alignments: list[Any], frame_length: int
     ) -> torch.Tensor:
-        """Build the assistant continuation timeline on the audio clock."""
+        """Build the assistant response timeline on the audio clock."""
         def render() -> torch.Tensor:
             tokens = [self.text_padding_id] * frame_length
             # Track lexical pieces separately. PAD and EPAD may be replaced by
@@ -161,7 +161,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
                 ensure(word_start + len(pieces) - 1)
                 if any(lexical[word_start : word_start + len(pieces)]):
                     raise TextAlignmentCollision(
-                        f"continuation BPE pieces collide at frame {word_start}"
+                        f"assistant-text BPE pieces collide at frame {word_start}"
                     )
                 epad_position = word_start - 1
                 # Moshi equation (5): insert EPAD at t_i - 1 unless doing so
@@ -195,7 +195,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         assistant_waveform = torch.from_numpy(wav[assistant_channel]).float().clamp(-1.0, 1.0)
         samples_per_frame = self.sample_rate / self.frame_rate
         frame_length = max(1, math.ceil(waveform.numel() / samples_per_frame))
-        continuation_tokens = self._aligned_text_stream(
+        assistant_text_tokens = self._aligned_text_stream(
             entry["inner_monologue_alignments"],
             frame_length,
         )
@@ -203,36 +203,36 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             "id": audio_path.stem,
             "waveform": waveform,
             "assistant_waveform": assistant_waveform,
-            "continuation_tokens": continuation_tokens,
+            "assistant_text_tokens": assistant_text_tokens,
             "audio_frame_length": frame_length,
-            "continuation_frame_length": continuation_tokens.numel(),
+            "assistant_text_frame_length": assistant_text_tokens.numel(),
         }
 
 
 def collate_dailytalk(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_samples = max(item["waveform"].numel() for item in batch)
-    max_continuation_frames = max(item["continuation_frame_length"] for item in batch)
+    max_assistant_text_frames = max(item["assistant_text_frame_length"] for item in batch)
     waveforms = torch.zeros(len(batch), 1, max_samples, dtype=torch.float32)
     assistant_waveforms = torch.zeros(len(batch), 1, max_samples, dtype=torch.float32)
-    continuation_tokens = torch.full(
-        (len(batch), max_continuation_frames), -1, dtype=torch.long
+    assistant_text_tokens = torch.full(
+        (len(batch), max_assistant_text_frames), -1, dtype=torch.long
     )
     for index, item in enumerate(batch):
         sample_length = item["waveform"].numel()
         waveforms[index, 0, :sample_length] = item["waveform"]
         assistant_waveforms[index, 0, :sample_length] = item["assistant_waveform"]
-        continuation_tokens[index, : item["continuation_frame_length"]] = item[
-            "continuation_tokens"
+        assistant_text_tokens[index, : item["assistant_text_frame_length"]] = item[
+            "assistant_text_tokens"
         ]
     return {
         "waveforms": waveforms,
         "assistant_waveforms": assistant_waveforms,
-        "continuation_tokens": continuation_tokens,
+        "assistant_text_tokens": assistant_text_tokens,
         "audio_frame_lengths": torch.tensor(
             [item["audio_frame_length"] for item in batch], dtype=torch.long
         ),
-        "continuation_frame_lengths": torch.tensor(
-            [item["continuation_frame_length"] for item in batch], dtype=torch.long
+        "assistant_text_frame_lengths": torch.tensor(
+            [item["assistant_text_frame_length"] for item in batch], dtype=torch.long
         ),
         "ids": [item["id"] for item in batch],
     }

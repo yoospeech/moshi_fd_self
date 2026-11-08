@@ -1,4 +1,4 @@
-"""Train user-audio conditioned assistant continuation with Moshi interleaving."""
+"""Train user-audio conditioned assistant response with Moshi interleaving."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 from .model import (
-    STTContinuationConfig,
-    SmolLM2MoshiSTTContinuation,
+    FullDuplexConfig,
+    MoshiFullDuplexModel,
     masked_multistream_loss,
 )
 from .dataset import DailyTalkDataset, collate_dailytalk
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mimi-checkpoint")
     parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
     parser.add_argument("--mimi-device", help="e.g. cuda:1; defaults to the training device")
-    parser.add_argument("--output", default="runs/stt_continuation")
+    parser.add_argument("--output", default="runs/full_duplex")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--text-only-fraction", type=float, default=0.5,
@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-card", type=int, default=2048)
     parser.add_argument("--context", type=int, default=3000)
     parser.add_argument(
-        "--continuation-delay-steps", type=int, default=0,
+        "--assistant-text-delay-steps", type=int, default=0,
         help="must remain 0 for assistant inner-monologue timing",
     )
     parser.add_argument("--acoustic-delay", type=int, default=1)
@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_checkpoint(model: SmolLM2MoshiSTTContinuation, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
+def save_checkpoint(model: MoshiFullDuplexModel, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     torch.save(
         {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
@@ -148,8 +148,8 @@ def save_checkpoint(model: SmolLM2MoshiSTTContinuation, optimizer: torch.optim.O
 
 
 def print_model_summary(
-    model: SmolLM2MoshiSTTContinuation,
-    config: STTContinuationConfig,
+    model: MoshiFullDuplexModel,
+    config: FullDuplexConfig,
     mimi: torch.nn.Module | None,
     *,
     full: bool = False,
@@ -199,15 +199,15 @@ def online_streams(
     batch: dict[str, object],
     mimi: torch.nn.Module,
     device: torch.device,
-    config: STTContinuationConfig,
+    config: FullDuplexConfig,
     acoustic_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build Moshi streams: assistant text/audio followed by user audio."""
-    continuation_tokens = batch["continuation_tokens"].to(  # type: ignore[union-attr]
+    assistant_text_tokens = batch["assistant_text_tokens"].to(  # type: ignore[union-attr]
         device, non_blocking=True
     )
     audio_frame_lengths = batch["audio_frame_lengths"].tolist()  # type: ignore[union-attr]
-    continuation_frame_lengths = batch["continuation_frame_lengths"].tolist()  # type: ignore[union-attr]
+    assistant_text_frame_lengths = batch["assistant_text_frame_lengths"].tolist()  # type: ignore[union-attr]
     mimi_device = next(mimi.parameters()).device
     waveforms = batch["waveforms"].to(mimi_device, non_blocking=True)  # type: ignore[union-attr]
     assistant_waveforms = batch["assistant_waveforms"].to(  # type: ignore[union-attr]
@@ -222,7 +222,7 @@ def online_streams(
 
     tail = max(config.delays)
     total_frames = max(
-        audio_codes.shape[-1], max(continuation_frame_lengths)
+        audio_codes.shape[-1], max(assistant_text_frame_lengths)
     ) + tail
     streams = torch.full(
         (audio_codes.shape[0], 1 + 2 * config.num_codebooks, total_frames),
@@ -236,19 +236,19 @@ def online_streams(
         acoustic_mask = acoustic_mask.to(device=device, dtype=torch.bool)
         if acoustic_mask.shape != (audio_codes.shape[0],):
             raise ValueError("acoustic_mask must have one boolean value per sample")
-    for index, (audio_frames, continuation_frames) in enumerate(
+    for index, (audio_frames, assistant_text_frames) in enumerate(
         zip(
             audio_frame_lengths,
-            continuation_frame_lengths,
+            assistant_text_frame_lengths,
             strict=True,
         )
     ):
         valid_audio_frames = min(audio_frames, audio_codes.shape[-1])
-        streams[index, 0, :continuation_frames] = continuation_tokens[
-            index, :continuation_frames
+        streams[index, 0, :assistant_text_frames] = assistant_text_tokens[
+            index, :assistant_text_frames
         ]
         streams[
-            index, 0, continuation_frames : continuation_frames + tail
+            index, 0, assistant_text_frames : assistant_text_frames + tail
         ] = config.text_padding_id
         if acoustic_mask[index]:
             valid_assistant_frames = min(audio_frames, assistant_codes.shape[-1])
@@ -263,14 +263,14 @@ def online_streams(
 
 @torch.no_grad()
 def evaluate(
-    model: SmolLM2MoshiSTTContinuation,
+    model: MoshiFullDuplexModel,
     loader: DataLoader,
     device: torch.device,
     dtype: torch.dtype,
     text_padding_id: int,
     max_batches: int,
     mimi: torch.nn.Module,
-    config: STTContinuationConfig,
+    config: FullDuplexConfig,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {}
@@ -355,7 +355,7 @@ def run_training() -> None:
     )
     base_text_card = len(tokenizer)
     # PAD and EPAD are shared vocabulary rows; timelines and heads are separate.
-    config = STTContinuationConfig(
+    config = FullDuplexConfig(
         temporal_model=model_name,
         trust_remote_code=trust_remote_code,
         text_card=base_text_card + 2,
@@ -364,7 +364,7 @@ def run_training() -> None:
         audio_card=args.audio_card,
         num_codebooks=args.num_codebooks,
         context=args.context,
-        continuation_delay_steps=args.continuation_delay_steps,
+        assistant_text_delay_steps=args.assistant_text_delay_steps,
         acoustic_delay_steps=args.acoustic_delay,
         depformer_dim=args.depformer_dim,
         depformer_heads=args.depformer_heads,
@@ -375,7 +375,7 @@ def run_training() -> None:
         semantic_loss_weight=args.semantic_loss_weight,
         text_padding_weight=args.text_padding_weight,
     )
-    model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
+    model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
     model.train()
 
     mimi = None

@@ -1,4 +1,4 @@
-"""Reference inference with forced user audio and assistant text continuation."""
+"""Reference inference with forced user audio and assistant text and audio response."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import sphn
 import torch
 from transformers import AutoTokenizer
 
-from .model import STTContinuationConfig, SmolLM2MoshiSTTContinuation
+from .model import FullDuplexConfig, MoshiFullDuplexModel
 from moshi.models import loaders as moshi_loaders
 from moshi.models.lm_utils import _undelay_sequence
 
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-temperature", type=float, default=0.8)
     parser.add_argument("--audio-top-k", type=int, default=250)
     parser.add_argument("--greedy", action="store_true")
-    parser.add_argument("--output", default="inference_text.json")
+    parser.add_argument("--output", default="full_duplex_output.json")
     parser.add_argument(
         "--audio-output",
         help="stereo WAV path (assistant ch0, user ch1); defaults to JSON path with .wav",
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(args: argparse.Namespace) -> STTContinuationConfig:
+def load_config(args: argparse.Namespace) -> FullDuplexConfig:
     checkpoint = Path(args.checkpoint)
     config_path = Path(args.config) if args.config else checkpoint.parent / "config.json"
     raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -60,7 +60,7 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
         raise ValueError(
             "Checkpoint is not a Moshi-style assistant-text checkpoint."
         )
-    names = {field.name for field in fields(STTContinuationConfig)}
+    names = {field.name for field in fields(FullDuplexConfig)}
     values = {key: value for key, value in raw.items() if key in names}
     if args.model:
         values["temporal_model"] = args.model
@@ -69,7 +69,7 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
         values["trust_remote_code"] = trust_remote_code
     elif args.model and "lfm3" in args.model.lower():
         values["trust_remote_code"] = True
-    config = STTContinuationConfig(**values)
+    config = FullDuplexConfig(**values)
     expected_delays = [0] + ([0] + [1] * (config.num_codebooks - 1)) * 2
     if config.delays != expected_delays:
         raise ValueError(
@@ -104,16 +104,16 @@ def load_user_waveform(path: Path, channel: int, sample_rate: int) -> torch.Tens
 
 
 @torch.inference_mode()
-def force_audio_sample_text(
-    model: SmolLM2MoshiSTTContinuation,
+def generate_assistant_text(
+    model: MoshiFullDuplexModel,
     audio_codes: torch.Tensor,
-    config: STTContinuationConfig,
+    config: FullDuplexConfig,
     *,
     temperature: float,
     top_k: int,
     greedy: bool,
 ) -> list[int]:
-    """Force user audio and sample the assistant continuation text."""
+    """Force user audio and sample the assistant response text."""
     if audio_codes.shape[0] != 1:
         raise ValueError("reference inference currently supports batch size 1")
     if audio_codes.shape[1] != config.num_codebooks:
@@ -176,9 +176,9 @@ def force_audio_sample_text(
 
 @torch.inference_mode()
 def generate_assistant(
-    model: SmolLM2MoshiSTTContinuation,
+    model: MoshiFullDuplexModel,
     user_audio_codes: torch.Tensor,
-    config: STTContinuationConfig,
+    config: FullDuplexConfig,
     *,
     text_temperature: float,
     text_top_k: int,
@@ -299,7 +299,7 @@ def generate_assistant(
 
 
 def render_tokens(
-    token_ids: list[int], tokenizer: AutoTokenizer, config: STTContinuationConfig
+    token_ids: list[int], tokenizer: AutoTokenizer, config: FullDuplexConfig
 ) -> tuple[str, list[dict[str, object]]]:
     special = {
         config.text_padding_id: "PAD",
@@ -341,7 +341,7 @@ def main() -> None:
         config.temporal_model,
         trust_remote_code=config.trust_remote_code,
     )
-    model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
+    model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
     print(f"memory-mapping checkpoint {args.checkpoint}", flush=True)
     package = torch.load(
         args.checkpoint,
@@ -371,7 +371,7 @@ def main() -> None:
     if tail_samples:
         waveform = torch.cat([waveform, torch.zeros(tail_samples)])
     audio_codes = mimi.encode(waveform[None, None].to(mimi_device))
-    continuation_token_ids, assistant_codes = generate_assistant(
+    assistant_text_token_ids, assistant_codes = generate_assistant(
         model,
         audio_codes,
         config,
@@ -383,8 +383,8 @@ def main() -> None:
         text_eos_id=tokenizer.eos_token_id,
     )
     assistant_waveform = mimi.decode(assistant_codes.to(mimi_device))
-    continuation_text, continuation_events = render_tokens(
-        continuation_token_ids, tokenizer, config
+    assistant_text, assistant_text_events = render_tokens(
+        assistant_text_token_ids, tokenizer, config
     )
     payload = {
         "audio": str(Path(args.audio)),
@@ -406,26 +406,26 @@ def main() -> None:
             "audio_top_k": args.audio_top_k,
             "seed": args.seed,
         },
-        "continuation_text": continuation_text,
+        "assistant_text": assistant_text,
         "transcript": {
-            "assistant_continuation": continuation_text,
+            "assistant_text": assistant_text,
         },
         "turns": [{
                 "speaker": "assistant",
-                "channel": "continuation",
-                "text": continuation_text,
+                "channel": "assistant_text",
+                "text": assistant_text,
                 "start_time": next(
-                    (event["time"] for event in continuation_events if event["token"] not in {"PAD", "EPAD"}),
+                    (event["time"] for event in assistant_text_events if event["token"] not in {"PAD", "EPAD"}),
                     None,
                 ),
                 "end_time": next(
-                    (event["time"] for event in reversed(continuation_events) if event["token"] not in {"PAD", "EPAD"}),
+                    (event["time"] for event in reversed(assistant_text_events) if event["token"] not in {"PAD", "EPAD"}),
                     None,
                 ),
             }
         ],
         "channels": {
-            "continuation": {"text": continuation_text, "events": continuation_events},
+            "assistant_text": {"text": assistant_text, "events": assistant_text_events},
         },
     }
     output = Path(args.output)
@@ -442,8 +442,8 @@ def main() -> None:
     assistant_mono = assistant_mono[:target_samples]
     stereo = torch.stack([assistant_mono, waveform[:target_samples]], dim=0)
     sphn.write_wav(audio_output, stereo.numpy(), mimi.sample_rate)
-    print("\nASSISTANT CONTINUATION")
-    print(continuation_text or "(empty)")
+    print("\nASSISTANT RESPONSE")
+    print(assistant_text or "(empty)")
     print(f"saved {output}")
     print(f"saved {audio_output}")
 

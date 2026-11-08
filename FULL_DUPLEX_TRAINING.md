@@ -1,4 +1,4 @@
-# Audio-to-Text Continuation Training
+# Moshi Full-Duplex Training
 
 The trainer learns one text stream from user audio:
 
@@ -8,7 +8,7 @@ assistant PAD/EPAD text + user Mimi audio
     -> assistant text head + Moshi Depth Transformer
 ```
 
-There is no ASR/user-text target. The manifest may contain `user_hyp`, but it
+User speech is condition-only and has no text target. The manifest may contain `user_hyp`, but it
 is ignored. Assistant targets are loaded from the JSON sidecar matching each
 WAV stem.
 
@@ -27,7 +27,7 @@ current-frame; acoustic codebooks are delayed by one frame.
 Use the complete tested command in
 [README.md](README.md#two-gpu-ddp-training). It reads the original
 `dailytalk.jsonl`, uses `models/SmolLM2-135M`, and writes to
-`runs/smollm2_135m_moshi_continuation`.
+`runs/smollm2_135m_moshi_full_duplex`.
 
 The documented commands use local paths under `models/`. Both
 `models/LFM3-1.7B` and `models/SmolLM2-135M` are recognized aliases and are

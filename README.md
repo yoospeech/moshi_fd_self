@@ -1,9 +1,9 @@
-# Moshi Audio-to-Text Continuation
+# Moshi Full-Duplex Fine-Tuning
 
 > Experimental research prototype.
 
 This project takes the user audio channel as a prompt and jointly predicts the
-assistant continuation text and assistant audio. User audio is conditioning
+assistant response text and assistant audio. User audio is conditioning
 only and is never an audio loss target.
 
 ```text
@@ -48,20 +48,20 @@ keep the pretrained text model active while adapting it to acoustic prompts.
 ## Repository layout
 
 ```text
-stt_continuation/model.py       model, interleaving, Depth Transformer, losses
-stt_continuation/dataset.py     stereo user prompt, assistant audio, and PAD/EPAD target
-stt_continuation/train.py       single-GPU/DDP training and validation
-stt_continuation/inference.py   force-fed user-audio inference
-train_stt_continuation.py       training CLI
-infer_stt_continuation.py       inference CLI
-tests/test_continuation.py      offline regression tests
+full_duplex/model.py       model, interleaving, Depth Transformer, losses
+full_duplex/dataset.py     stereo user prompt, assistant audio, and PAD/EPAD target
+full_duplex/train.py       single-GPU/DDP training and validation
+full_duplex/inference.py   force-fed user-audio inference
+train_full_duplex.py       training CLI
+infer_full_duplex.py       inference CLI
+tests/test_full_duplex.py      offline regression tests
 ```
 
 ## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/yoospeech/moshi_asr_self.git
-cd moshi_asr_self
+git clone --recurse-submodules https://github.com/yoospeech/moshi_fd_self.git
+cd moshi_fd_self
 pip install -r requirements.txt
 pip install --no-deps -e thirdparty/moshi/moshi
 ```
@@ -93,7 +93,7 @@ Use the original manifest:
 ```
 
 For a row whose audio path is `data_stereo/406.wav`, user audio is read from
-WAV channel 1 by default and assistant continuation timestamps are read from
+WAV channel 1 by default and assistant response timestamps are read from
 `data_stereo/406.json`. `user_hyp`, `user_406.json`, and Whisper transcripts
 are not used. Relative audio paths are resolved from the manifest directory.
 
@@ -107,11 +107,11 @@ This checks model construction, Temporal and Depth forward passes, losses,
 backward, and optimizer updates without loading a dataset or Mimi:
 
 ```bash
-cd /home/speech/Documents/workspace/moshi_stt_self
+cd /home/speech/Documents/workspace/moshi_fd_self
 
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
-train_stt_continuation.py \
+train_full_duplex.py \
   --model models/SmolLM2-135M \
   --model-download-root models \
   --smoke-test \
@@ -119,7 +119,7 @@ train_stt_continuation.py \
   --acoustic-delay 1 \
   --batch-size 1 \
   --text-only-fraction 0 \
-  --output /tmp/moshi_continuation_smoke
+  --output /tmp/moshi_full_duplex_smoke
 ```
 
 ## Current machine: single-GPU LFM3-1.7B training
@@ -136,13 +136,13 @@ OMP_NUM_THREADS=4 \
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH=thirdparty/moshi/moshi \
 /home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
-train_stt_continuation.py \
+train_full_duplex.py \
   --manifest /home/ysw/Documents/eee/moshi-finetune/daily-talk-contiguous/dailytalk.jsonl \
   --model models/LFM3-1.7B \
   --model-download-root models \
   --trust-remote-code \
   --num-codebooks 4 \
-  --continuation-delay-steps 0 \
+  --assistant-text-delay-steps 0 \
   --acoustic-delay 1 \
   --depformer-dim 1024 \
   --depformer-heads 16 \
@@ -154,32 +154,32 @@ train_stt_continuation.py \
   --text-padding-weight 0.5 \
   --batch-size 4 \
   --text-only-fraction 0.5 \
-  --grad-accum 2 \
+  --grad-accum 1 \
   --steps 100000 \
   --learning-rate 2e-4 \
   --temporal-learning-rate 2e-5 \
   --min-duration 5 \
-  --max-duration 200 \
+  --max-duration 100 \
   --min-words 5 \
   --min-words-per-second 0.5 \
   --max-words-per-second 2.5 \
   --valid-ratio 0.05 \
   --valid-every 500 \
-  --valid-batches 20 \
+  --valid-batches 54 \
   --log-every 10 \
   --save-every 500 \
   --print-model \
-  --output runs/lfm3_1_7b_moshi_feedback
+  --output runs/LFM3-1.7B_mixed_full_duplex
 ```
 
-This gives an effective batch of `4 × accumulation 2 = 8`, split evenly
+This gives an effective batch of `4 × accumulation 1 = 4`, split evenly
 between acoustic and text-only samples. If memory is insufficient, use
-`--batch-size 2 --grad-accum 4`; the effective batch remains 8.
+`--batch-size 2 --grad-accum 2`; the effective batch remains 4.
 
 ## Two-GPU DDP training
 
 ```bash
-cd /home/speech/Documents/workspace/moshi_stt_self
+cd /home/speech/Documents/workspace/moshi_fd_self
 
 CUDA_VISIBLE_DEVICES=0,1 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -188,12 +188,12 @@ PYTHONPATH=thirdparty/moshi/moshi \
 -m torch.distributed.run \
   --standalone \
   --nproc_per_node=2 \
-  train_stt_continuation.py \
+  train_full_duplex.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.jsonl \
   --model models/SmolLM2-135M \
   --model-download-root models \
   --num-codebooks 4 \
-  --continuation-delay-steps 0 \
+  --assistant-text-delay-steps 0 \
   --acoustic-delay 1 \
   --depformer-dim 1024 \
   --depformer-heads 16 \
@@ -220,7 +220,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --log-every 10 \
   --save-every 500 \
   --print-model \
-  --output runs/smollm2_135m_moshi_continuation
+  --output runs/smollm2_135m_moshi_full_duplex
 ```
 
 ### LFM3-1.7B alternative
@@ -232,7 +232,7 @@ code. To run the larger model, change these arguments:
   --model models/LFM3-1.7B \
   --model-download-root models \
   --trust-remote-code \
-  --output runs/lfm3_1_7b_moshi_continuation
+  --output runs/lfm3_1_7b_moshi_full_duplex
 ```
 
 SmolLM2-135M is the documented default for pipeline validation and small-data
@@ -256,7 +256,7 @@ Mimi device can then be selected with `--mimi-device cuda:1`.
 
 ```text
 loss                    total optimized loss
-assistant_text          assistant continuation cross-entropy
+assistant_text          assistant response cross-entropy
 assistant_audio         assistant Mimi codebook loss (only when audio loss weight > 0)
 assistant_np_accuracy   assistant lexical/EPAD accuracy excluding PAD
 assistant_all_accuracy  assistant accuracy including PAD frames
@@ -264,7 +264,7 @@ audio_acc               mean assistant Mimi codebook accuracy (only when audio l
 ```
 
 PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use
-`assistant_np_accuracy` to judge whether actual continuation tokens improve.
+`assistant_np_accuracy` to judge whether actual assistant tokens improve.
 `--text-padding-weight 0.5` gives each non-PAD target twice the loss weight
 of each PAD target; it changes optimization, not the reported accuracies.
 The documented default objective is joint assistant text and audio:
@@ -279,19 +279,19 @@ pass while retaining user audio as conditioning. `--semantic-loss-weight`
 controls the first assistant codebook when audio loss is enabled.
 
 ```bash
-tensorboard --logdir runs/smollm2_135m_moshi_continuation/tensorboard
+tensorboard --logdir runs/smollm2_135m_moshi_full_duplex/tensorboard
 ```
 
 ## Inference
 
 ```bash
-cd /home/speech/Documents/workspace/moshi_stt_self
+cd /home/speech/Documents/workspace/moshi_fd_self
 
 CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
-infer_stt_continuation.py \
-  --checkpoint runs/smollm2_135m_moshi_continuation/checkpoint_00100000.pt \
+infer_full_duplex.py \
+  --checkpoint runs/smollm2_135m_moshi_full_duplex/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --device cuda \
@@ -310,7 +310,7 @@ then ignored. For mono user audio use `--user-channel 0`. `--tail-seconds 10`
 appends silence before Mimi encoding so the audio clock has time to emit a
 response.
 
-The command writes assistant continuation metadata to JSON and a time-aligned
+The command writes assistant response metadata to JSON and a time-aligned
 stereo WAV: channel 0 is generated assistant speech, channel 1 is the selected
 original user waveform with the requested silence tail. For mono recordings
 use `--user-channel 0`. No transcript or timestamp sidecar is needed at inference.
@@ -323,15 +323,15 @@ fixed input-plus-tail duration.
 {
   "stream_order": ["assistant_text", "assistant_audio_q0", "assistant_audio_q1", "assistant_audio_q2", "assistant_audio_q3", "user_audio_q0", "user_audio_q1", "user_audio_q2", "user_audio_q3"],
   "delay_pattern": [0, 0, 1, 1, 1, 0, 1, 1, 1],
-  "continuation_text": "Assistant response",
-  "transcript": {"assistant_continuation": "Assistant response"},
-  "channels": {"continuation": {"text": "Assistant response", "events": []}}
+  "assistant_text": "Assistant response",
+  "transcript": {"assistant_text": "Assistant response"},
+  "channels": {"assistant_text": {"text": "Assistant response", "events": []}}
 }
 ```
 
 ## Compatibility and limitations
 
-New checkpoints record `text_context_mode: "moshi"`. Older dual-text/ASR
+New checkpoints record `text_context_mode: "moshi"`. Older incompatible
 checkpoints are rejected because their stream count, heads, and delay pattern
 are incompatible.
 
@@ -347,5 +347,5 @@ Run regression tests with:
   -m unittest discover -s tests -v
 ```
 
-See [training details](STT_CONTINUATION_TRAINING.md) and
-[inference details](STT_CONTINUATION_INFERENCE.md).
+See [training details](FULL_DUPLEX_TRAINING.md) and
+[inference details](FULL_DUPLEX_INFERENCE.md).

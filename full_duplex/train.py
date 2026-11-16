@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--continuation-min-suffix-seconds", type=float, default=1.0)
     parser.add_argument("--continuation-min-gap-seconds", type=float, default=0.1)
     parser.add_argument("--continuation-max-gap-seconds", type=float, default=0.5)
-    parser.add_argument("--model", default="models/SmolLM2-135M")
+    parser.add_argument("--model", default="models/LFM3-1.7B")
     parser.add_argument(
         "--model-download-root",
         default="models",

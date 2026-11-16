@@ -21,7 +21,7 @@ from moshi.models.lm_utils import _delay_sequence, _undelay_sequence  # noqa: E4
 
 @dataclass
 class FullDuplexConfig:
-    temporal_model: str = "models/SmolLM2-135M"
+    temporal_model: str = "models/LFM3-1.7B"
     trust_remote_code: bool = False
     text_card: int = 49154
     audio_card: int = 2048

@@ -37,7 +37,7 @@ manifest is created.
 ```bash
 PYTHONPATH=. /data/util/anaconda3/envs/duplexomni/bin/python \
   train_full_duplex.py \
-  --model SmolLM2-135M \
+  --model LFM3-1.7B \
   --task mono_post_training \
   --folders '/data/ko:ko,/data/en:en,/data/hi:hi,/data/id:id' \
   --alignment-mode online \
@@ -76,16 +76,16 @@ checks duration, word rate, timestamps, speech coverage and BPE collisions.
 
 ## Model and distributed execution
 
-`SmolLM2-135M` and `LFM3-1.7B` are known model aliases under `models/` and are
-downloaded when absent. Local model paths and Hugging Face repository IDs are
-also accepted. SmolLM2-135M is the model verified end to end in this workspace;
-LFM3 still needs a separate runtime check.
+`LFM3-1.7B` is the default model. `SmolLM2-135M` is also available as a known
+alias under `models/`. Missing aliases are downloaded automatically; local model
+paths and Hugging Face repository IDs are also accepted. SmolLM2-135M has been
+verified end to end in this workspace; LFM3 still needs a separate runtime check.
 
 Example stereo DDP launch:
 
 ```bash
 PYTHONPATH=. torchrun --standalone --nproc_per_node=2 train_full_duplex.py \
-  --model SmolLM2-135M --task finetuning \
+  --model LFM3-1.7B --task finetuning \
   --manifest /path/to/stereo_dialogue.jsonl \
   --batch-size 4 --grad-accum 2 --steps 1000 \
   --output runs/stereo_ddp

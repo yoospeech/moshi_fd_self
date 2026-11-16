@@ -8,7 +8,12 @@ from unittest.mock import Mock, patch
 import numpy as np
 import soundfile as sf
 
-from full_duplex.dataset import MonoContinuationDataset, collate_duplex
+from full_duplex.dataset import (
+    MonoContinuationDataset,
+    RecoverableSampleError,
+    collate_duplex,
+)
+from full_duplex.train import SkipInvalidDataset
 
 
 class Tokenizer:
@@ -17,6 +22,26 @@ class Tokenizer:
 
 
 class MonoPipelineTests(unittest.TestCase):
+    def test_lazy_invalid_sample_is_skipped_and_cached_within_split(self):
+        class Samples:
+            def __init__(self):
+                self.calls = []
+
+            def __len__(self):
+                return 3
+
+            def __getitem__(self, index):
+                self.calls.append(index)
+                if index == 0:
+                    raise RecoverableSampleError('collision')
+                return index
+
+        samples = Samples()
+        dataset = SkipInvalidDataset(samples)
+        self.assertEqual(dataset[0], 1)
+        self.assertEqual(dataset[0], 1)
+        self.assertEqual(samples.calls, [0, 1, 1])
+
     def test_bad_annotations_and_collision_are_filtered(self):
         with tempfile.TemporaryDirectory() as directory:
             broken = Path(directory) / 'bad.json'

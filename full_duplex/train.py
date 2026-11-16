@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
@@ -24,6 +24,7 @@ from .model import (
 from .dataset import (
     StereoDialogueDataset,
     MonoContinuationDataset,
+    RecoverableSampleError,
     collate_duplex,
 )
 from .distributed import TrainingObjective, setup, barrier
@@ -35,6 +36,35 @@ MODEL_REPOSITORIES = {
     "SmolLM2-135M": "HuggingFaceTB/SmolLM2-135M",
     "LFM3-1.7B": "LiquidAI/LFM3-1.7B",
 }
+
+
+class SkipInvalidDataset(Dataset):
+    """Keep lazy mono failures from terminating an otherwise valid epoch.
+
+    Replacement lookup stays inside the wrapped train or validation subset,
+    so a rejected item cannot leak across the deterministic split.
+    """
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+        self.invalid_indices: set[int] = set()
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        last_error: RecoverableSampleError | None = None
+        for offset in range(len(self)):
+            candidate = (index + offset) % len(self)
+            if candidate in self.invalid_indices:
+                continue
+            try:
+                return self.dataset[candidate]
+            except RecoverableSampleError as error:
+                self.invalid_indices.add(candidate)
+                last_error = error
+                print(f"skipping invalid mono sample: {error}", flush=True)
+        raise RuntimeError("no valid samples remain in dataset split") from last_error
 
 
 def acoustic_prompt_mask(
@@ -584,6 +614,9 @@ def run_training() -> None:
                 ),
                 encoding="utf-8",
             )
+        if args.task == "mono_post_training" and args.alignment_mode == "online":
+            train_dataset = SkipInvalidDataset(train_dataset)
+            valid_dataset = SkipInvalidDataset(valid_dataset)
         if world_size > 1:
             if train_size < world_size:
                 raise ValueError("training split must contain at least one sample per rank")

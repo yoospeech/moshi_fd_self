@@ -19,6 +19,10 @@ class TextAlignmentCollision(ValueError):
     """Two lexical tokens cannot fit on the same fixed text timeline."""
 
 
+class RecoverableSampleError(ValueError):
+    """A lazily prepared sample is unusable and may be skipped."""
+
+
 def discover_mono_continuation_entries(
     folders: str, *, max_files: int = 0, include_unannotated: bool = False
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -484,9 +488,11 @@ class MonoContinuationDataset(StereoDialogueDataset):
             return alignments
         except (torch.cuda.OutOfMemoryError, MemoryError):
             raise
-        except Exception:
+        except Exception as error:
             self.timing_stats["alignment_failed"] += 1
-            raise
+            raise RecoverableSampleError(
+                f"{entry['path']}: Whisper alignment failed"
+            ) from error
         finally:
             self.timing_stats["alignment_inference_seconds"] += (
                 time.perf_counter() - alignment_start
@@ -505,7 +511,10 @@ class MonoContinuationDataset(StereoDialogueDataset):
             self.min_prefix_seconds, self.min_suffix_seconds,
         )
         if split is None:
-            raise ValueError(f"{entry['path']}: no usable word boundary for continuation split")
+            self.rejected["split"] += 1
+            raise RecoverableSampleError(
+                f"{entry['path']}: no usable word boundary for continuation split"
+            )
         gap = self.gap_seconds[0] + random_value * (
             self.gap_seconds[1] - self.gap_seconds[0]
         )
@@ -515,10 +524,14 @@ class MonoContinuationDataset(StereoDialogueDataset):
             if float(times[0]) >= split
         ]
         if self.tokenizer is not None:
-            self._aligned_text_stream(
-                suffix_alignments,
-                max(1, math.ceil((float(entry["duration"]) + gap) * self.frame_rate)),
-            )
+            try:
+                self._aligned_text_stream(
+                    suffix_alignments,
+                    max(1, math.ceil((float(entry["duration"]) + gap) * self.frame_rate)),
+                )
+            except TextAlignmentCollision as error:
+                self.rejected["text_collision"] += 1
+                raise RecoverableSampleError(f"{entry['path']}: {error}") from error
         entry.update(
             alignments=alignments, split_seconds=split, gap_seconds=gap
         )

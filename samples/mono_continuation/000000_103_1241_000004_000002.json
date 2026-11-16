@@ -1,0 +1,49 @@
+{
+  "source_path": "/data/db/LibriTTS_R/train-clean-100/103/1241/103_1241_000004_000002.wav",
+  "split_seconds": 4.4,
+  "gap_seconds": 0.49007183377547103,
+  "assistant_channel": 0,
+  "user_channel": 1,
+  "alignments": [
+    [
+      "a",
+      [
+        4.890071833775472,
+        5.030071833775471
+      ],
+      "SPEAKER_MAIN"
+    ],
+    [
+      "little",
+      [
+        5.030071833775471,
+        5.2300718337754715
+      ],
+      "SPEAKER_MAIN"
+    ],
+    [
+      "of",
+      [
+        5.2300718337754715,
+        5.410071833775471
+      ],
+      "SPEAKER_MAIN"
+    ],
+    [
+      "the",
+      [
+        5.410071833775471,
+        5.510071833775471
+      ],
+      "SPEAKER_MAIN"
+    ],
+    [
+      "greyness.",
+      [
+        5.510071833775471,
+        5.890071833775472
+      ],
+      "SPEAKER_MAIN"
+    ]
+  ]
+}

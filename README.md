@@ -1,386 +1,101 @@
-# Moshi Full-Duplex Fine-Tuning
+# Moshi Training
 
 > Experimental research prototype.
 
-This project takes the user audio channel as a prompt and jointly predicts the
-assistant response text and assistant audio. User audio is conditioning
-only and is never an audio loss target.
+Train a full-duplex model to predict assistant text and speech from user audio.
+User audio is conditioning only and is never an audio loss target.
 
-```text
-stereo WAV channel 1 --> frozen Mimi --> user audio conditioning stream
-stereo WAV channel 0 --> frozen Mimi --> assistant audio target stream
-assistant PAD/EPAD timeline ------------> Temporal Transformer
-                                             |-- assistant text head
-                                             `-- assistant audio Depth Transformer
-```
-
-## Streams and timing
-
-```text
-streams: [assistant_text, assistant_audio(q0..q3), user_audio(q0..q3)]
-delays:  [0,              0,1,1,1,          0,1,1,1]
-```
-
-Assistant text and both semantic audio codebooks are placed at the current
-12.5 Hz frame. The three acoustic codebooks in each audio stream lag by one
-frame (80 ms), following Moshi's semantic/acoustic interleaving. Assistant
-audio is teacher-forced only through its causal past; its current frame is the
-Depth prediction target. User audio is prompt conditioning and has no loss.
-
-Assistant word timestamps are converted to the original Moshi PAD/EPAD
-timeline. EPAD is placed immediately before a word unless that would overwrite
-a lexical token. No speaker BEGIN/END tokens are used.
-
-### Causal learning rhythm: PAD, audio context, then lexical text
-
-A useful way to understand the aligned sequence is `PAD -> audio context ->
-EPAD -> non-PAD text`. This is a recurring causal rhythm on the shared audio
-clock, not four separately scheduled training stages:
-
-```text
-time frame       t-2          t-1          t            t+1
-assistant text   PAD          EPAD         lexical      PAD / next token
-audio context    Mimi tokens  Mimi tokens  Mimi tokens  Mimi tokens
-```
-
-During silent or listening frames, PAD keeps the assistant text stream aligned
-with the continuously advancing Mimi audio streams. The Temporal Transformer
-therefore learns the acoustic state while the text target remains PAD. EPAD at
-the frame immediately before a word is a learned boundary signal that says a
-lexical token is about to begin. The following non-PAD token is then predicted
-from the causal history containing the user prompt, past assistant audio, PAD
-timing, and EPAD boundary. Assistant audio is predicted in parallel through the
-Depth Transformer and is fed back only as past context at later frames.
-
-Thus PAD is not merely ignored blank space: it teaches when not to emit text,
-EPAD teaches when speech/text emission is about to start, and non-PAD tokens
-teach what to say. User audio participates only in that conditioning history;
-it is never an optimization target.
-
-Training treats user Mimi tokens as an acoustic prompt and optimizes assistant
-text cross-entropy plus assistant Mimi codebook cross-entropy. User Mimi tokens
-are never audio targets. Offline inference force-feeds user Mimi tokens,
-autoregressively samples assistant text and audio, feeds generated assistant
-audio back into later Temporal frames, and decodes it to a WAV file.
-
-Each training batch mixes acoustic-conditioned and text-only examples. With
-the documented `--batch-size 4 --text-only-fraction 0.5`, every rank receives
-two examples with the user-audio prompt and two examples with the acoustic
-streams removed. Their positions are sampled randomly in every batch; both
-groups retain the assistant text target. The text-only half is replay from the
-paired assistant-text dataset, not a separate external text corpus, and helps
-keep the pretrained text model active while adapting it to acoustic prompts.
-
-## Repository layout
-
-```text
-full_duplex/model.py       model, interleaving, Depth Transformer, losses
-full_duplex/dataset.py     stereo user prompt, assistant audio, and PAD/EPAD target
-full_duplex/train.py       single-GPU/DDP training and validation
-full_duplex/inference.py   force-fed user-audio inference
-train_full_duplex.py       training CLI
-infer_full_duplex.py       inference CLI
-tests/test_full_duplex.py      offline regression tests
-```
+- [Training guide](TRAINING.md): architecture, mono post-training, stereo fine-tuning,
+  online alignment, losses, timing, DDP and checkpoints.
+- [Inference guide](INFERENCE.md): checkpoint loading, decoding, channels and outputs.
 
 ## Setup
+
+Run commands from the repository root with the intended Python environment active.
 
 ```bash
 git clone --recurse-submodules https://github.com/yoospeech/moshi_fd_self.git
 cd moshi_fd_self
-pip install -r requirements.txt
-pip install --no-deps -e thirdparty/moshi/moshi
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e thirdparty/moshi/moshi
 ```
 
-The project uses Transformers 5 tokenizer metadata. Moshi is installed with
-`--no-deps` because its upstream package metadata still caps
-`huggingface-hub` and `safetensors` below the versions used here; the Moshi
-APIs exercised by this project are covered by the smoke and regression tests.
+The verified environment uses Python 3.11, transformers 4.57.6,
+huggingface-hub 0.36.2, moshi 0.2.13 and whisper-timestamped 1.15.9.
+The local interpreter used for verification is
+`/data/util/anaconda3/envs/duplexomni/bin/python`.
+Moshi 0.2.13 requires Hub below 1.0; transformers 5.x is incompatible with
+that requirement. Prefer an isolated environment for this project.
 
-Model paths are standardized under the project `models/` directory:
+## Mono continuation post-training
 
-```text
-models/SmolLM2-135M
-models/LFM3-1.7B
-```
-
-If either known path is absent, rank 0 downloads the corresponding official
-Hugging Face repository into that path and the other DDP ranks wait. LFM3
-remote model code is trusted automatically; SmolLM2 does not require it. An
-arbitrary Hugging Face repository ID or existing local directory is also
-accepted. If `--mimi-checkpoint` is omitted, Mimi is resolved from Kyutai.
-
-## Data
-
-Use the original manifest:
-
-```text
-/data/db/daily-talk-contiguous/dailytalk.jsonl
-```
-
-For a row whose audio path is `data_stereo/406.wav`, user audio is read from
-WAV channel 1 by default and assistant response timestamps are read from
-`data_stereo/406.json`. `user_hyp`, `user_406.json`, and Whisper transcripts
-are not used. Relative audio paths are resolved from the manifest directory.
-
-Default filtering keeps samples with duration 5–200 seconds, at least 5
-assistant words, 0.5–2.5 assistant words/second, valid timestamps, 5–80%
-assistant timestamp coverage, and no lexical BPE collision at 12.5 Hz.
-
-## Smoke test
-
-This checks model construction, Temporal and Depth forward passes, losses,
-backward, and optimizer updates without loading a dataset or Mimi:
+Split mono speech at a word boundary into a user prefix and assistant suffix.
+Pass a comma-separated list of `folder:language` inputs using Whisper codes.
 
 ```bash
-cd /home/speech/Documents/workspace/moshi_fd_self
-
-PYTHONPATH=thirdparty/moshi/moshi \
-/data/util/anaconda3/envs/duplexomni/bin/python \
-train_full_duplex.py \
-  --model models/SmolLM2-135M \
-  --model-download-root models \
-  --smoke-test \
-  --smoke-steps 1 \
-  --acoustic-delay 1 \
-  --batch-size 1 \
-  --text-only-fraction 0 \
-  --output /tmp/moshi_full_duplex_smoke
+PYTHONPATH=. python train_full_duplex.py \
+  --task mono_post_training \
+  --folders '/data/db/LibriTTS_R:en' \
+  --alignment-mode online --alignment-model medium --alignment-device cpu \
+  --batch-size 4 --steps 1000 --output runs/mono_post_training
 ```
 
-## Current machine: single-GPU LFM3-1.7B training
+Missing or invalid word alignments are extracted during dataset initialization.
+Existing valid sidecars are reused; newly extracted alignments stay in memory.
+The first batch starts after extraction completes. See
+[online alignment and execution details](TRAINING.md#mono-continuation-post-training).
 
-The following command uses the local Conda environment, downloaded LFM3 model,
-and DailyTalk manifest on this machine. Run it directly with one Python process;
-do not set `--nproc_per_node=2` when only one GPU is visible.
+## Stereo dialogue fine-tuning
+
+Read existing stereo user/assistant audio and assistant timestamp sidecars.
 
 ```bash
-cd /home/ysw/Documents/eee/moshi_fd_self
-
-CUDA_VISIBLE_DEVICES=0 \
-OMP_NUM_THREADS=4 \
-PYTORCH_ALLOC_CONF=expandable_segments:True \
-PYTHONPATH=thirdparty/moshi/moshi \
-/home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
-train_full_duplex.py \
-  --manifest /home/ysw/Documents/eee/moshi-finetune/daily-talk-contiguous/dailytalk.jsonl \
-  --model models/LFM3-1.7B \
-  --model-download-root models \
-  --trust-remote-code \
-  --num-codebooks 4 \
-  --assistant-text-delay-steps 0 \
-  --acoustic-delay 1 \
-  --depformer-dim 1024 \
-  --depformer-heads 16 \
-  --depformer-layers 6 \
-  --depformer-ffn-dim 4096 \
-  --audio-loss-weight 0.1 \
-  --text-loss-weight 1.0 \
-  --semantic-loss-weight 100 \
-  --text-padding-weight 0.5 \
-  --batch-size 4 \
-  --text-only-fraction 0.5 \
-  --grad-accum 1 \
-  --steps 100000 \
-  --learning-rate 2e-4 \
-  --temporal-learning-rate 2e-5 \
-  --min-duration 5 \
-  --max-duration 100 \
-  --min-words 5 \
-  --min-words-per-second 0.5 \
-  --max-words-per-second 2.5 \
-  --valid-ratio 0.05 \
-  --valid-every 500 \
-  --valid-batches 54 \
-  --log-every 10 \
-  --save-every 500 \
-  --print-model \
-  --output runs/LFM3-1.7B_mixed_full_duplex
+PYTHONPATH=. python train_full_duplex.py \
+  --task finetuning --manifest /path/to/stereo_dialogue.jsonl \
+  --batch-size 4 --steps 1000 --output runs/stereo_finetuning
 ```
 
-This gives an effective batch of `4 × accumulation 1 = 4`, split evenly
-between acoustic and text-only samples. If memory is insufficient, use
-`--batch-size 2 --grad-accum 2`; the effective batch remains 4.
+Both tasks use the same batch format and online Mimi encoding.
+See [stereo input requirements](TRAINING.md#stereo-dialogue-fine-tuning).
 
-## Two-GPU DDP training
+## Verification
 
 ```bash
-cd /home/speech/Documents/workspace/moshi_fd_self
-
-CUDA_VISIBLE_DEVICES=0,1 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-PYTHONPATH=thirdparty/moshi/moshi \
-/data/util/anaconda3/envs/duplexomni/bin/python \
--m torch.distributed.run \
-  --standalone \
-  --nproc_per_node=2 \
-  train_full_duplex.py \
-  --manifest /data/db/daily-talk-contiguous/dailytalk.jsonl \
-  --model models/SmolLM2-135M \
-  --model-download-root models \
-  --num-codebooks 4 \
-  --assistant-text-delay-steps 0 \
-  --acoustic-delay 1 \
-  --depformer-dim 1024 \
-  --depformer-heads 16 \
-  --depformer-layers 6 \
-  --depformer-ffn-dim 4096 \
-  --audio-loss-weight 0.1 \
-  --text-loss-weight 1.0 \
-  --semantic-loss-weight 100 \
-  --text-padding-weight 0.5 \
-  --batch-size 4 \
-  --text-only-fraction 0.5 \
-  --grad-accum 2 \
-  --steps 100000 \
-  --learning-rate 2e-4 \
-  --temporal-learning-rate 2e-5 \
-  --min-duration 5 \
-  --max-duration 200 \
-  --min-words 5 \
-  --min-words-per-second 0.5 \
-  --max-words-per-second 2.5 \
-  --valid-ratio 0.05 \
-  --valid-every 500 \
-  --valid-batches 20 \
-  --log-every 10 \
-  --save-every 500 \
-  --print-model \
-  --output runs/smollm2_135m_moshi_full_duplex
+PYTHONPATH=. python -m unittest discover -s tests -v
+PYTHONPATH=. python train_full_duplex.py \
+  --model SmolLM2-135M --smoke-test --smoke-steps 1 \
+  --batch-size 1 --text-only-fraction 0 --output runs/model_smoke
 ```
 
-### LFM3-1.7B alternative
-
-LFM3-1.7B uses the same architecture, streams, targets, losses, and inference
-code. To run the larger model, change these arguments:
-
-```bash
-  --model models/LFM3-1.7B \
-  --model-download-root models \
-  --trust-remote-code \
-  --output runs/lfm3_1_7b_moshi_full_duplex
-```
-
-SmolLM2-135M is the documented default for pipeline validation and small-data
-overfitting. LFM3-1.7B is the higher-capacity alternative.
-
-Do not pass `--mimi-device` in DDP; every rank places frozen Mimi and its model
-on the local GPU. Batch size is per rank, so the effective batch above is
-`2 GPUs × batch 4 × accumulation 2 = 16`: 8 acoustic-conditioned and 8
-text-only examples per optimizer update. `--steps` counts microbatches. Only
-rank 0 validates and writes checkpoints.
-
-`--text-only-fraction` is applied independently inside every rank's training
-batch. A value of `0.5` reserves half the samples for text-only replay. At
-least one acoustic-conditioned sample is retained, including in a short final
-batch. Validation remains fully acoustic-conditioned.
-
-For one GPU, run the script directly without `torch.distributed.run`. A separate
-Mimi device can then be selected with `--mimi-device cuda:1`.
-
-### CLI metrics
-
-```text
-loss                    total optimized loss
-assistant_text          assistant response cross-entropy
-assistant_audio         assistant Mimi codebook loss (only when audio loss weight > 0)
-assistant_np_accuracy   assistant lexical/EPAD accuracy excluding PAD
-assistant_all_accuracy  assistant accuracy including PAD frames
-audio_acc               mean assistant Mimi codebook accuracy (only when audio loss weight > 0)
-assistant_rq_accuracy_1  assistant Mimi RQ1/semantic-codebook accuracy
-assistant_rq_accuracy_2  assistant Mimi RQ2 accuracy
-assistant_rq_accuracy_3  assistant Mimi RQ3 accuracy
-assistant_rq_accuracy_4  assistant Mimi RQ4 accuracy
-```
-
-PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use
-`assistant_np_accuracy` to judge whether actual assistant tokens improve.
-`--text-padding-weight 0.5` gives each non-PAD target twice the loss weight
-of each PAD target; it changes optimization, not the reported accuracies.
-The documented default objective is joint assistant text and audio:
-
-```text
-loss = 1.0 * assistant_text + 0.1 * assistant_audio
-```
-
-The user audio stream still conditions the acoustic half of each batch; setting
-`--audio-loss-weight 0` skips assistant audio prediction and its Depth forward
-pass while retaining user audio as conditioning. `--semantic-loss-weight`
-controls the first assistant codebook when audio loss is enabled.
-
-```bash
-tensorboard --logdir runs/smollm2_135m_moshi_full_duplex/tensorboard
-```
+The model smoke uses synthetic codec tokens; it does not test Whisper or Mimi.
+The verified real-data path is single-GPU SmolLM2-135M with Whisper medium
+alignment and Mimi encoding. LFM3 is a selectable model alias but has not
+been validated end-to-end in this environment.
+See [bounded real-data verification](TRAINING.md#run-mono-post-training).
 
 ## Inference
 
 ```bash
-cd /home/speech/Documents/workspace/moshi_fd_self
-
-CUDA_VISIBLE_DEVICES=0 \
-PYTHONPATH=thirdparty/moshi/moshi \
-/data/util/anaconda3/envs/duplexomni/bin/python \
-infer_full_duplex.py \
-  --checkpoint runs/smollm2_135m_moshi_full_duplex/checkpoint_00100000.pt \
-  --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
-  --user-channel 1 \
-  --device cuda \
-  --mimi-device cuda:0 \
-  --disable-lfm3-triton \
-  --tail-seconds 10 \
-  --text-temperature 0.7 \
-  --text-top-k 25 \
-  --audio-temperature 0.8 \
-  --audio-top-k 250 \
-  --audio-output inference_outputs/0.wav \
-  --output inference_outputs/0.json
+PYTHONPATH=. python infer_full_duplex.py \
+  --checkpoint runs/mono_post_training/checkpoint_00001000.pt \
+  --audio /path/to/user.wav --user-channel 0 \
+  --device cuda --tail-seconds 10 \
+  --output inference_outputs/response.json \
+  --audio-output inference_outputs/response.wav
 ```
 
-Add `--greedy` for deterministic argmax decoding; temperature and top-k are
-then ignored. For mono user audio use `--user-channel 0`. `--tail-seconds 10`
-appends silence before Mimi encoding so the audio clock has time to emit a
-response.
+Outputs contain assistant text and stereo audio (assistant channel 0, user
+channel 1). No annotation sidecar is needed. See [inference details](INFERENCE.md).
 
-On GB10 (`sm_121a`), use `--disable-lfm3-triton` when the Triton-bundled
-`ptxas` does not recognize the GPU target. This selects LFM3's equivalent
-PyTorch causal-convolution fallback and does not change checkpoint weights.
+## Repository layout
 
-The command writes assistant response metadata to JSON and a time-aligned
-stereo WAV: channel 0 is generated assistant speech, channel 1 is the selected
-original user waveform with the requested silence tail. For mono recordings
-use `--user-channel 0`. No transcript or timestamp sidecar is needed at inference.
-Generation runs on the delayed timeline, then undelays codebooks before Mimi
-decoding. Startup acoustic slots use INIT and final out-of-range slots are
-absent, matching training. Text EOS latches text to PAD; audio runs through the
-fixed input-plus-tail duration.
-
-```json
-{
-  "stream_order": ["assistant_text", "assistant_audio_q0", "assistant_audio_q1", "assistant_audio_q2", "assistant_audio_q3", "user_audio_q0", "user_audio_q1", "user_audio_q2", "user_audio_q3"],
-  "delay_pattern": [0, 0, 1, 1, 1, 0, 1, 1, 1],
-  "assistant_text": "Assistant response",
-  "transcript": {"assistant_text": "Assistant response"},
-  "channels": {"assistant_text": {"text": "Assistant response", "events": []}}
-}
+```text
+full_duplex/model.py       model, streams, Depth Transformer and losses
+full_duplex/dataset.py     stereo dialogue and mono continuation datasets
+full_duplex/train.py       single-GPU/DDP training, validation and timing
+full_duplex/inference.py   user-conditioned assistant text/audio generation
+scripts/annotate.py        word alignment extraction
+train_full_duplex.py       training CLI
+infer_full_duplex.py       inference CLI
+tests/                    regression tests
 ```
-
-## Compatibility and limitations
-
-New checkpoints record `text_context_mode: "moshi"`. Older incompatible
-checkpoints are rejected because their stream count, heads, and delay pattern
-are incompatible.
-
-Reference inference recomputes the Temporal prefix once per delayed frame and
-the Depth prefix per codebook. KV-cache streaming is not implemented.
-Old text-only checkpoints do not have the extra audio embeddings required by
-this dual-audio architecture and cannot be loaded directly.
-
-Run regression tests with:
-
-```bash
-/data/util/anaconda3/envs/duplexomni/bin/python \
-  -m unittest discover -s tests -v
-```
-
-See [training details](FULL_DUPLEX_TRAINING.md) and
-[inference details](FULL_DUPLEX_INFERENCE.md).

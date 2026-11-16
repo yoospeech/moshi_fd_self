@@ -1,8 +1,9 @@
 torch>=2.2,<2.10
-transformers>=5.22,<6
-huggingface-hub>=2.4,<3
+transformers>=4.46,<5
+huggingface-hub>=0.24,<1
 safetensors>=0.8,<1
 sphn>=0.2,<0.3
+soundfile>=0.12,<1
 tensorboard>=2.14
 numpy>=1.26,<2.3
 whisper-timestamped>=1.15,<2

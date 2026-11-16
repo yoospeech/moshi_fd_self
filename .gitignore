@@ -29,7 +29,7 @@ data/
 
 # Small listening examples intentionally committed with the source.
 !samples/
-!samples/*.wav
+!samples/**/*.wav
 
 .DS_Store
 Thumbs.db

@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from transformers import LlamaConfig, LlamaModel
 
-from full_duplex.dataset import DailyTalkDataset, TextAlignmentCollision
+from full_duplex.dataset import StereoDialogueDataset, MonoContinuationDataset, TextAlignmentCollision
 from full_duplex.model import (
     FullDuplexConfig, MoshiFullDuplexModel, masked_multistream_loss,
 )
@@ -22,6 +22,33 @@ from moshi.models.lm_utils import _delay_sequence
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_mono_continuation_keeps_prefix_and_suffix_on_separate_streams(self):
+        class Tokenizer:
+            def encode(self, text, **kwargs):
+                return {" world": [7]}[text]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.jsonl").write_text(json.dumps({
+                "path": "0.wav", "duration": 4,
+                "alignments": [["hello", [0, 2], "S"], ["world", [2, 4], "S"]],
+            }) + "\n")
+            dataset = MonoContinuationDataset(
+                root / "manifest.jsonl", Tokenizer(), text_padding_id=10, text_epad_id=11,
+                min_duration=0, min_prefix_seconds=1, min_suffix_seconds=1,
+                gap_seconds=(0.5, 0.5), seed=1,
+            )
+            audio = torch.linspace(-1, 1, 96000, dtype=torch.float32).numpy()
+            with patch("full_duplex.dataset.sphn.read", return_value=(audio, 24000)):
+                item = dataset[0]
+            split = round(dataset.entries[0]["split_seconds"] * 24000)
+            gap = round(dataset.entries[0]["gap_seconds"] * 24000)
+            self.assertEqual(dataset.entries[0]["split_seconds"], 2)
+            self.assertTrue((item["waveform"][split:] == 0).all())
+            self.assertTrue((item["assistant_waveform"][: split + gap] == 0).all())
+            self.assertTrue((item["assistant_waveform"][split + gap :] == torch.from_numpy(audio[split:])).all())
+            self.assertIn(7, item["assistant_text_tokens"].tolist())
+
     def test_manifest_target_and_audio_channel(self):
         class Tokenizer:
             def encode(self, text, **kwargs):
@@ -37,7 +64,7 @@ class AlignmentTests(unittest.TestCase):
                 "path": "0.wav", "duration": 2, "user_channel": 0,
                 "assistant_channel": 1,
             }) + "\n")
-            ds = DailyTalkDataset(
+            ds = StereoDialogueDataset(
                 manifest, Tokenizer(), text_padding_id=10, text_epad_id=11,
                 min_duration=0, min_words=1, min_words_per_second=0,
                 min_speech_coverage=0, max_speech_coverage=1,
@@ -54,7 +81,7 @@ class AlignmentTests(unittest.TestCase):
             def encode(self, text, **kwargs):
                 return {" multi": [1, 2], " next": [3]}[text]
 
-        ds = object.__new__(DailyTalkDataset)
+        ds = object.__new__(StereoDialogueDataset)
         ds.tokenizer = Tokenizer()
         ds.frame_rate = 12.5
         ds.text_padding_id, ds.text_epad_id = 10, 11

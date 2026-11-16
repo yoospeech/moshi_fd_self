@@ -1,0 +1,33 @@
+{
+  "source_path": "/data/db/LibriTTS_R/train-clean-100/103/1241/103_1241_000020_000016.wav",
+  "split_seconds": 1.28,
+  "gap_seconds": 0.37643322895426456,
+  "assistant_channel": 0,
+  "user_channel": 1,
+  "alignments": [
+    [
+      "the",
+      [
+        1.8364332289542644,
+        1.9964332289542646
+      ],
+      "SPEAKER_MAIN"
+    ],
+    [
+      "asylum",
+      [
+        1.9964332289542646,
+        2.2764332289542644
+      ],
+      "SPEAKER_MAIN"
+    ],
+    [
+      "people.",
+      [
+        2.2764332289542644,
+        2.5764332289542646
+      ],
+      "SPEAKER_MAIN"
+    ]
+  ]
+}

@@ -1,9 +1,11 @@
-"""DailyTalk user audio and aligned assistant response targets."""
+"""Duplex user audio and aligned assistant text/audio targets."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +19,79 @@ class TextAlignmentCollision(ValueError):
     """Two lexical tokens cannot fit on the same fixed text timeline."""
 
 
-class DailyTalkDataset(Dataset[dict[str, Any]]):
-    """Read target speech and word-level alignments from DailyTalkContiguous.
+def discover_mono_continuation_entries(
+    folders: str, *, max_files: int = 0, include_unannotated: bool = False
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Discover annotated mono WAVs from comma-separated ``folder:language`` inputs.
+
+    Without include_unannotated, only WAVs with JSON sidecars are kept.
+    """
+    import soundfile as sf
+
+    if max_files < 0:
+        raise ValueError("max_files must be non-negative")
+    parts = folders.split(",")
+    if any(not part.strip() for part in parts):
+        raise ValueError("folder list contains an empty path")
+    sources: list[tuple[Path, str]] = []
+    for part in parts:
+        value = part.strip()
+        if ":" not in value:
+            raise ValueError(
+                f"missing language for folder: {value!r}; use /path/to/data:en"
+            )
+        folder, language = value.rsplit(":", 1)
+        if not folder or not language.strip():
+            raise ValueError(f"invalid folder:language input: {value!r}")
+        source = (Path(folder).expanduser().resolve(), language.strip())
+        if source not in sources:
+            sources.append(source)
+    if not sources:
+        raise ValueError("at least one input folder is required")
+    for root, _language in sources:
+        if not root.is_dir():
+            raise ValueError(f"not a directory: {root}")
+    paths: dict[Path, str] = {}
+    for root, language in sources:
+        for path in root.rglob("*.wav"):
+            resolved = path.resolve()
+            previous = paths.get(resolved)
+            if previous is not None and previous != language:
+                raise ValueError(
+                    f"conflicting languages for {resolved}: {previous!r} and {language!r}"
+                )
+            paths[resolved] = language
+    entries: list[dict[str, Any]] = []
+    stats = {"wav": len(paths), "annotated": 0, "unannotated": 0, "invalid": 0}
+    for path, language in sorted(paths.items()):
+        sidecar = path.with_suffix(".json")
+        if not sidecar.is_file():
+            stats["unannotated"] += 1
+            if not include_unannotated:
+                continue
+        try:
+            info = sf.info(path)
+            if info.channels != 1 or info.frames <= 0:
+                stats["invalid"] += 1
+                continue
+            entries.append(
+                {
+                    "path": str(path),
+                    "duration": info.frames / info.samplerate,
+                    "alignment_path": str(sidecar),
+                    "language": language,
+                }
+            )
+            stats["annotated"] += int(sidecar.is_file())
+            if max_files and len(entries) >= max_files:
+                break
+        except (RuntimeError, OSError):
+            stats["invalid"] += 1
+    return entries, stats
+
+
+class StereoDialogueDataset(Dataset[dict[str, Any]]):
+    """Read stereo dialogues and assistant word-level alignments.
 
     Audio tokenization intentionally happens after collation so frozen Mimi can
     run online on the training device.
@@ -26,7 +99,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
 
     def __init__(
         self,
-        manifest: str | Path,
+        manifest: str | Path | None,
         tokenizer: PreTrainedTokenizerBase,
         *,
         sample_rate: int = 24000,
@@ -75,9 +148,8 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             # The assistant-side transcript is the response target, i.e.
             # the model's inner-monologue text stream.  The current sidecar
             # schema stores its timestamped words under ``alignments``.
-            inner_monologue_alignments = json.loads(
-                audio_path.with_suffix(".json").read_text(encoding="utf-8")
-            )["alignments"]
+            sidecar = json.loads(audio_path.with_suffix(".json").read_text(encoding="utf-8"))
+            inner_monologue_alignments = sidecar["alignments"]
             word_count = len(inner_monologue_alignments)
             if word_count < min_words:
                 self.rejected["words"] += 1
@@ -119,6 +191,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             self.entries.append(
                 {
                     **entry,
+                    "language": entry.get("language", sidecar.get("language", "unknown")),
                     "inner_monologue_alignments": inner_monologue_alignments,
                 }
             )
@@ -196,11 +269,11 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         samples_per_frame = self.sample_rate / self.frame_rate
         frame_length = max(1, math.ceil(waveform.numel() / samples_per_frame))
         assistant_text_tokens = self._aligned_text_stream(
-            entry["inner_monologue_alignments"],
-            frame_length,
+            entry["inner_monologue_alignments"], frame_length
         )
         return {
             "id": audio_path.stem,
+            "language": entry.get("language", "unknown"),
             "waveform": waveform,
             "assistant_waveform": assistant_waveform,
             "assistant_text_tokens": assistant_text_tokens,
@@ -209,7 +282,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         }
 
 
-def collate_dailytalk(batch: list[dict[str, Any]]) -> dict[str, Any]:
+def collate_duplex(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_samples = max(item["waveform"].numel() for item in batch)
     max_assistant_text_frames = max(item["assistant_text_frame_length"] for item in batch)
     waveforms = torch.zeros(len(batch), 1, max_samples, dtype=torch.float32)
@@ -235,4 +308,291 @@ def collate_dailytalk(batch: list[dict[str, Any]]) -> dict[str, Any]:
             [item["assistant_text_frame_length"] for item in batch], dtype=torch.long
         ),
         "ids": [item["id"] for item in batch],
+        "languages": [item.get("language", "unknown") for item in batch],
     }
+
+
+class MonoContinuationDataset(StereoDialogueDataset):
+    """Turn mono speech into a synthetic ``user prefix -> assistant suffix`` turn.
+
+    The manifest is JSONL with at least ``path`` and ``duration``. Put word
+    alignments inline as ``alignments``, point to a JSON sidecar with
+    ``alignment_path``, or place a sidecar next to the WAV (``0.wav`` ->
+    ``0.json``). An alignment uses the existing ``[word, [start, end],
+    speaker]`` schema. By default, samples without alignment are rejected so
+    the split can never cut through a word.
+    """
+
+    def __init__(
+        self,
+        manifest: str | Path,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        sample_rate: int = 24000,
+        frame_rate: float = 12.5,
+        text_padding_id: int,
+        text_epad_id: int,
+        min_duration: float = 2.0,
+        max_duration: float = 45.0,
+        min_prefix_seconds: float = 1.0,
+        min_suffix_seconds: float = 1.0,
+        gap_seconds: tuple[float, float] = (0.1, 0.5),
+        seed: int = 42,
+        entries: list[dict[str, Any]] | None = None,
+        folders: str | None = None,
+        max_files: int = 0,
+        online_alignment: bool = False,
+        whisper_model: str = "medium",
+        alignment_device: str = "cpu",
+    ) -> None:
+        if min_prefix_seconds <= 0 or min_suffix_seconds <= 0:
+            raise ValueError("continuation prefix and suffix durations must be positive")
+        if gap_seconds[0] < 0 or gap_seconds[1] < gap_seconds[0]:
+            raise ValueError("invalid continuation gap range")
+        if sum(value is not None for value in (manifest, entries, folders)) != 1:
+            raise ValueError("provide exactly one of manifest, entries, or folders")
+        self.manifest = Path(manifest) if manifest is not None else None
+        self.root = self.manifest.parent if self.manifest is not None else Path.cwd()
+        self.tokenizer = tokenizer
+        self.sample_rate = sample_rate
+        self.frame_rate = frame_rate
+        self.text_padding_id = text_padding_id
+        self.text_epad_id = text_epad_id
+        self.original_size = 0
+        self.entries: list[dict[str, Any]] = []
+        self.rejected = {"duration": 0, "split": 0, "alignment": 0, "text_collision": 0}
+        timing_start = time.perf_counter()
+        self.timing_stats: dict[str, float | int] = {
+            "discovery_seconds": 0.0,
+            "alignment_model_load_seconds": 0.0,
+            "alignment_inference_seconds": 0.0,
+            "filter_seconds": 0.0,
+            "alignment_extracted": 0,
+            "alignment_reused": 0,
+            "alignment_failed": 0,
+        }
+        self.discovery_stats: dict[str, int] | None = None
+        discovery_start = time.perf_counter()
+        if folders is not None:
+            raw_entries, self.discovery_stats = discover_mono_continuation_entries(
+                folders, max_files=max_files, include_unannotated=online_alignment
+            )
+        elif entries is None:
+            assert self.manifest is not None
+            with self.manifest.open(encoding="utf-8") as handle:
+                raw_entries = [json.loads(line) for line in handle if line.strip()]
+        else:
+            raw_entries = entries
+        self.timing_stats["discovery_seconds"] = time.perf_counter() - discovery_start
+        self.original_size = len(raw_entries)
+        if online_alignment:
+            if folders is None:
+                raise ValueError("online alignment requires folders with explicit languages")
+            # Run in the training process before DataLoader workers start. Never
+            # retain Whisper in the dataset sent to worker processes.
+            from scripts import annotate
+            from types import SimpleNamespace
+            import logging
+            model = None
+            try:
+                for entry in raw_entries:
+                    if not min_duration <= float(entry["duration"]) <= max_duration:
+                        continue
+                    try:
+                        words = self._load_alignments(entry)
+                        if words:
+                            self._validate_alignments(words, float(entry["duration"]))
+                            self.timing_stats["alignment_reused"] += 1
+                            continue
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass
+                    if model is None:
+                        model_load_start = time.perf_counter()
+                        model = annotate.whisper.load_model(whisper_model, device=alignment_device)
+                        self.timing_stats["alignment_model_load_seconds"] = (
+                            time.perf_counter() - model_load_start
+                        )
+                    try:
+                        alignment_start = time.perf_counter()
+                        result = annotate.process_one(
+                            Path(entry["path"]), None, entry["language"], model,
+                            SimpleNamespace(keep_silence_in_segments=1.0),
+                        )
+                        self.timing_stats["alignment_extracted"] += 1
+                        entry["alignments"] = result["alignments"]
+                    except (torch.cuda.OutOfMemoryError, MemoryError):
+                        raise
+                    except Exception:
+                        self.timing_stats["alignment_failed"] += 1
+                        logging.getLogger(__name__).exception("Alignment failed: %s", entry["path"])
+                        entry["alignments"] = []
+                    finally:
+                        self.timing_stats["alignment_inference_seconds"] += time.perf_counter() - alignment_start
+            finally:
+                del model
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        filter_start = time.perf_counter()
+        for index, entry in enumerate(raw_entries):
+            duration = float(entry["duration"])
+            if not min_duration <= duration <= max_duration:
+                self.rejected["duration"] += 1
+                continue
+            try:
+                alignments = self._load_alignments(entry)
+                if alignments:
+                    alignments = self._validate_alignments(alignments, duration)
+            except (OSError, ValueError, KeyError, TypeError):
+                self.rejected["alignment"] += 1
+                continue
+            if not alignments:
+                self.rejected["alignment"] += 1
+                continue
+            random_value = self._random_value(seed, index, str(entry["path"]))
+            split = self._split_time(
+                duration, alignments, random_value, min_prefix_seconds, min_suffix_seconds
+            )
+            if split is None:
+                self.rejected["split"] += 1
+                continue
+            gap = gap_seconds[0] + random_value * (gap_seconds[1] - gap_seconds[0])
+            suffix_alignments = [
+                [word, [float(times[0]) + gap, float(times[1]) + gap], speaker]
+                for word, times, speaker in alignments
+                if float(times[0]) >= split
+            ]
+            try:
+                # Audio-only exporters pass None; training always supplies its tokenizer.
+                if self.tokenizer is not None:
+                    self._aligned_text_stream(
+                        suffix_alignments, max(1, math.ceil((duration + gap) * self.frame_rate))
+                    )
+            except TextAlignmentCollision:
+                self.rejected["text_collision"] += 1
+                continue
+            self.entries.append(
+                {**entry, "duration": duration, "split_seconds": split,
+                 "gap_seconds": gap, "alignments": alignments}
+            )
+        self.timing_stats["filter_seconds"] = time.perf_counter() - filter_start
+        self.timing_stats["total_seconds"] = time.perf_counter() - timing_start
+        self.filtered_hours = sum(float(entry["duration"]) for entry in self.entries) / 3600
+        if not self.entries:
+            if self.rejected["alignment"] == self.original_size:
+                raise ValueError(
+                    f"empty mono continuation dataset ({self.manifest or folders}); "
+                    "word-alignment sidecars are missing (run annotate.py first)"
+                )
+            raise ValueError(f"empty mono continuation dataset: {self.manifest or folders}")
+
+    def _load_alignments(self, entry: dict[str, Any]) -> list[Any] | None:
+        if "alignments" in entry:
+            return entry["alignments"]
+        alignment_value = entry.get("alignment_path")
+        if not alignment_value:
+            audio_path = Path(entry["path"])
+            if not audio_path.is_absolute():
+                audio_path = self.root / audio_path
+            alignment_path = audio_path.with_suffix(".json")
+            if not alignment_path.exists():
+                return None
+        else:
+            alignment_path = Path(alignment_value)
+        if not alignment_path.is_absolute():
+            alignment_path = self.root / alignment_path
+        payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+        return payload["alignments"]
+
+    @staticmethod
+    def _random_value(seed: int, index: int, path: str) -> float:
+        digest = hashlib.blake2b(f"{seed}:{index}:{path}".encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big") / 2**64
+
+    @staticmethod
+    def _validate_alignments(alignments: list[Any], duration: float) -> list[Any]:
+        result = []
+        for alignment in alignments:
+            if len(alignment) != 3:
+                raise ValueError("invalid alignment")
+            word, timestamps, speaker = alignment
+            start, end = map(float, timestamps)
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start or end > duration + 0.05:
+                raise ValueError("invalid alignment timestamp")
+            result.append([str(word), [start, end], speaker])
+        return sorted(result, key=lambda item: item[1][0])
+
+    @staticmethod
+    def _split_time(
+        duration: float,
+        alignments: list[Any] | None,
+        random_value: float,
+        min_prefix: float,
+        min_suffix: float,
+    ) -> float | None:
+        lower, upper = min_prefix, duration - min_suffix
+        if upper <= lower:
+            return None
+        desired = lower + random_value * (upper - lower)
+        if not alignments:
+            return None
+        # Splitting at a word end preserves both lexical streams.  Do not fall
+        # back to a mid-word split when timestamped text is available.
+        boundaries = [
+            float(item[1][1]) for item in alignments
+            if lower <= float(item[1][1]) <= upper
+            and any(float(other[1][0]) >= float(item[1][1]) for other in alignments)
+            and not any(float(other[1][0]) < float(item[1][1]) < float(other[1][1]) for other in alignments)
+        ]
+        return min(boundaries, key=lambda value: abs(value - desired)) if boundaries else None
+
+    def render_stereo(self, index: int) -> tuple[torch.Tensor, torch.Tensor, list[Any] | None]:
+        """Render a synthetic turn; stack as ``[assistant, user]`` for WAV."""
+        entry = self.entries[index]
+        audio_path = Path(entry["path"])
+        if not audio_path.is_absolute():
+            audio_path = self.root / audio_path
+        wav, _ = sphn.read(audio_path, sample_rate=self.sample_rate)
+        if wav.ndim == 2 and wav.shape[0] == 1:
+            wav = wav[0]
+        if wav.ndim != 1:
+            raise ValueError(f"{audio_path}: mono post-training expects mono audio")
+        source = torch.from_numpy(wav).float().clamp(-1.0, 1.0)
+        split_samples = min(source.numel(), round(float(entry["split_seconds"]) * self.sample_rate))
+        gap_samples = round(float(entry["gap_seconds"]) * self.sample_rate)
+        total_samples = source.numel() + gap_samples
+        user = torch.zeros(total_samples, dtype=torch.float32)
+        assistant = torch.zeros(total_samples, dtype=torch.float32)
+        user[:split_samples] = source[:split_samples]
+        assistant[split_samples + gap_samples :] = source[split_samples:]
+        alignments = entry["alignments"]
+        if alignments is None:
+            return user, assistant, None
+        split = float(entry["split_seconds"])
+        gap = float(entry["gap_seconds"])
+        suffix_alignments = [
+            [word, [float(times[0]) + gap, float(times[1]) + gap], speaker]
+            for word, times, speaker in alignments
+            if float(times[0]) >= split
+        ]
+        return user, assistant, suffix_alignments
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        user, assistant, suffix_alignments = self.render_stereo(index)
+        frame_length = max(1, math.ceil(user.numel() / (self.sample_rate / self.frame_rate)))
+        if suffix_alignments is None:
+            assistant_text_tokens = torch.full(
+                (frame_length,), self.text_padding_id, dtype=torch.long
+            )
+        else:
+            assistant_text_tokens = self._aligned_text_stream(suffix_alignments, frame_length)
+        return {
+            "id": f"{Path(self.entries[index]['path']).stem}-{index}",
+            "language": self.entries[index].get("language", "unknown"),
+            "waveform": user,
+            "assistant_waveform": assistant,
+            "assistant_text_tokens": assistant_text_tokens,
+            "audio_frame_length": frame_length,
+            "assistant_text_frame_length": assistant_text_tokens.numel(),
+        }

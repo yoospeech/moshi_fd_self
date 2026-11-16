@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -20,7 +21,11 @@ from .model import (
     MoshiFullDuplexModel,
     masked_multistream_loss,
 )
-from .dataset import DailyTalkDataset, collate_dailytalk
+from .dataset import (
+    StereoDialogueDataset,
+    MonoContinuationDataset,
+    collate_duplex,
+)
 from .distributed import TrainingObjective, setup, barrier
 
 from moshi.models import loaders as moshi_loaders
@@ -71,6 +76,26 @@ def resolve_model_source(model: str, download_root: str) -> tuple[Path, str | No
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
+    parser.add_argument("--alignment-mode", choices=("online", "sidecar"), default="online",
+                        help="extract missing word alignments during folder dataset initialization")
+    parser.add_argument("--alignment-model", default="medium")
+    parser.add_argument("--alignment-device", default="cpu")
+    parser.add_argument(
+        "--folders",
+        help="comma-separated folder:language inputs for mono_post_training, e.g. /data/en:en,/data/ko:ko",
+    )
+    parser.add_argument(
+        "--max-files", type=int, default=0,
+        help="limit annotated files discovered by --folders; 0 uses all",
+    )
+    parser.add_argument(
+        "--task", choices=("mono_post_training", "finetuning"), default="finetuning",
+        help="mono_post_training splits mono speech; finetuning reads stereo dialogue",
+    )
+    parser.add_argument("--continuation-min-prefix-seconds", type=float, default=1.0)
+    parser.add_argument("--continuation-min-suffix-seconds", type=float, default=1.0)
+    parser.add_argument("--continuation-min-gap-seconds", type=float, default=0.1)
+    parser.add_argument("--continuation-max-gap-seconds", type=float, default=0.5)
     parser.add_argument("--model", default="models/SmolLM2-135M")
     parser.add_argument(
         "--model-download-root",
@@ -135,7 +160,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=4)
     parser.add_argument("--print-model", action="store_true", help="print the full PyTorch module tree")
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 
 def save_checkpoint(model: MoshiFullDuplexModel, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
@@ -317,6 +343,7 @@ def main() -> None:
 
 
 def run_training() -> None:
+    startup_start = time.perf_counter()
     args = parse_args()
     if not 0.0 <= args.text_only_fraction <= 1.0:
         raise ValueError("text-only-fraction must be between 0 and 1")
@@ -349,10 +376,12 @@ def run_training() -> None:
         if args.trust_remote_code is not None
         else "lfm3" in model_name.lower()
     )
+    tokenizer_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=trust_remote_code,
     )
+    tokenizer_seconds = time.perf_counter() - tokenizer_start
     base_text_card = len(tokenizer)
     # PAD and EPAD are shared vocabulary rows; timelines and heads are separate.
     config = FullDuplexConfig(
@@ -375,11 +404,15 @@ def run_training() -> None:
         semantic_loss_weight=args.semantic_loss_weight,
         text_padding_weight=args.text_padding_weight,
     )
+    model_start = time.perf_counter()
     model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
     model.train()
+    model_seconds = time.perf_counter() - model_start
 
     mimi = None
+    mimi_seconds = 0.0
     if not args.smoke_test:
+        mimi_start = time.perf_counter()
         mimi_checkpoint = args.mimi_checkpoint
         if mimi_checkpoint is None:
             mimi_checkpoint = str(moshi_loaders.hf_get(moshi_loaders.MIMI_NAME, args.mimi_repo))
@@ -392,10 +425,17 @@ def run_training() -> None:
         mimi.eval()
         for parameter in mimi.parameters():
             parameter.requires_grad_(False)
+        mimi_seconds = time.perf_counter() - mimi_start
 
     if primary:
         print_model_summary(model, config, mimi, full=args.print_model)
         print(f"world_size={world_size} effective_batch={world_size * args.batch_size * args.grad_accum}")
+        print(
+            f"startup timing: tokenizer={tokenizer_seconds:.3f}s "
+            f"model={model_seconds:.3f}s mimi={mimi_seconds:.3f}s "
+            f"total={time.perf_counter() - startup_start:.3f}s",
+            flush=True,
+        )
     print(f"rank={rank} training_device={device} mimi_device={device if world_size > 1 else args.mimi_device or device}", flush=True)
 
     tensorboard_dir = Path(args.tensorboard_dir or Path(args.output) / "tensorboard")
@@ -406,6 +446,10 @@ def run_training() -> None:
             "TensorBoard logging requires the 'tensorboard' package: pip install tensorboard"
         ) from error
     writer = SummaryWriter(log_dir=str(tensorboard_dir)) if primary else None
+    if writer is not None:
+        writer.add_scalar("timing/startup_tokenizer_seconds", tokenizer_seconds, 0)
+        writer.add_scalar("timing/startup_model_seconds", model_seconds, 0)
+        writer.add_scalar("timing/startup_mimi_seconds", mimi_seconds, 0)
 
     objective = TrainingObjective(
         model,
@@ -454,21 +498,61 @@ def run_training() -> None:
         valid_loader = None
         target_steps = args.smoke_steps
     else:
-        if args.manifest is None:
-            raise SystemExit("--manifest is required unless --smoke-test is used")
-        dataset = DailyTalkDataset(
-            args.manifest,
-            tokenizer,
-            sample_rate=24000,
-            frame_rate=config.frame_rate,
-            text_padding_id=config.text_padding_id,
-            text_epad_id=config.text_epad_id,
-            min_duration=args.min_duration,
-            max_duration=args.max_duration,
-            min_words=args.min_words,
-            min_words_per_second=args.min_words_per_second,
-            max_words_per_second=args.max_words_per_second,
-        )
+        if args.task == "mono_post_training":
+            if args.folders and args.manifest:
+                raise SystemExit("pass either --folders or --manifest, not both")
+            dataset_source = args.manifest
+            if args.folders:
+                dataset_source = None
+            elif args.manifest is None:
+                raise SystemExit(
+                    "mono_post_training requires --folders or --manifest unless --smoke-test is used"
+                )
+            dataset = MonoContinuationDataset(
+                dataset_source, tokenizer, folders=args.folders, max_files=args.max_files,
+                online_alignment=bool(args.folders) and args.alignment_mode == "online",
+                whisper_model=args.alignment_model, alignment_device=args.alignment_device,
+                sample_rate=24000, frame_rate=config.frame_rate,
+                text_padding_id=config.text_padding_id, text_epad_id=config.text_epad_id,
+                min_duration=args.min_duration, max_duration=args.max_duration,
+                min_prefix_seconds=args.continuation_min_prefix_seconds,
+                min_suffix_seconds=args.continuation_min_suffix_seconds,
+                gap_seconds=(args.continuation_min_gap_seconds, args.continuation_max_gap_seconds),
+                seed=args.seed,
+            )
+            if dataset.discovery_stats is not None:
+                print(f"folder discovery: {dataset.discovery_stats}")
+            print(
+                "dataset timing: "
+                + " ".join(
+                    f"{name}={value:.3f}s" if isinstance(value, float) else f"{name}={value}"
+                    for name, value in dataset.timing_stats.items()
+                ),
+                flush=True,
+            )
+            if writer is not None:
+                for name, value in dataset.timing_stats.items():
+                    writer.add_scalar(f"timing/dataset_{name}", float(value), 0)
+        else:
+            if args.folders:
+                raise SystemExit("--folders is supported only by --task mono_post_training")
+            if args.manifest is None:
+                raise SystemExit(
+                    "fine-tuning requires --manifest unless --smoke-test is used"
+                )
+            dataset = StereoDialogueDataset(
+                args.manifest,
+                tokenizer,
+                sample_rate=24000,
+                frame_rate=config.frame_rate,
+                text_padding_id=config.text_padding_id,
+                text_epad_id=config.text_epad_id,
+                min_duration=args.min_duration,
+                max_duration=args.max_duration,
+                min_words=args.min_words,
+                min_words_per_second=args.min_words_per_second,
+                max_words_per_second=args.max_words_per_second,
+            )
         print(
             f"dataset filter: original={dataset.original_size} kept={len(dataset)} "
             f"hours={dataset.filtered_hours:.2f} rejected={dataset.rejected}"
@@ -514,7 +598,7 @@ def run_training() -> None:
             sampler=train_sampler,
             num_workers=2,
             pin_memory=device.type == "cuda",
-            collate_fn=collate_dailytalk,
+            collate_fn=collate_duplex,
         )
         valid_loader = DataLoader(
             valid_dataset,
@@ -522,7 +606,7 @@ def run_training() -> None:
             shuffle=False,
             num_workers=2,
             pin_memory=device.type == "cuda",
-            collate_fn=collate_dailytalk,
+            collate_fn=collate_duplex,
         )
         print(f"dataset split: train={train_size} valid={valid_size} seed={args.seed}")
         batches = loader
@@ -531,10 +615,16 @@ def run_training() -> None:
     optimizer.zero_grad(set_to_none=True)
     step = 0
     epoch = 0
+    timing_totals = {"data": 0.0, "mimi": 0.0, "train": 0.0, "step": 0.0}
+    timing_steps = 0
+    previous_step_end = time.perf_counter()
     while step < target_steps:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         for batch in batches:
+            step_start = time.perf_counter()
+            data_seconds = step_start - previous_step_end
+            mimi_start = time.perf_counter()
             if args.smoke_test:
                 streams = batch["streams"].to(device, non_blocking=True).clone()
                 acoustic_mask = acoustic_prompt_mask(
@@ -554,6 +644,10 @@ def run_training() -> None:
                 streams = online_streams(
                     batch, mimi, device, config, acoustic_mask
                 )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            mimi_encode_seconds = time.perf_counter() - mimi_start if not args.smoke_test else 0.0
+            train_start = time.perf_counter()
             autocast = (
                 torch.autocast(device_type="cuda", dtype=dtype)
                 if device.type == "cuda"
@@ -572,7 +666,16 @@ def run_training() -> None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            train_seconds = time.perf_counter() - train_start
             step += 1
+            step_seconds = time.perf_counter() - step_start
+            timing_steps += 1
+            timing_totals["data"] += data_seconds
+            timing_totals["mimi"] += mimi_encode_seconds
+            timing_totals["train"] += train_seconds
+            timing_totals["step"] += step_seconds
             if step % args.log_every == 0 or step == 1:
                 if world_size > 1:
                     for value in metrics.values():
@@ -583,6 +686,10 @@ def run_training() -> None:
                     writer.add_scalar(name, value.item(), step)
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
+                writer.add_scalar("timing/data_seconds", data_seconds, step)
+                writer.add_scalar("timing/mimi_seconds", mimi_encode_seconds, step)
+                writer.add_scalar("timing/train_seconds", train_seconds, step)
+                writer.add_scalar("timing/step_seconds", step_seconds, step)
                 audio_log = (
                     f"assistant_audio={metrics['loss/assistant_audio'].item():.4f} "
                     if "loss/assistant_audio" in metrics else ""
@@ -599,6 +706,15 @@ def run_training() -> None:
                     f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
                     f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f} "
                     f"{rq_log}",
+                    flush=True,
+                )
+                print(
+                    f"timing step: data={data_seconds:.3f}s mimi={mimi_encode_seconds:.3f}s "
+                    f"train={train_seconds:.3f}s total={step_seconds:.3f}s | "
+                    f"avg: data={timing_totals['data']/timing_steps:.3f}s "
+                    f"mimi={timing_totals['mimi']/timing_steps:.3f}s "
+                    f"train={timing_totals['train']/timing_steps:.3f}s "
+                    f"total={timing_totals['step']/timing_steps:.3f}s",
                     flush=True,
                 )
             if primary and not args.smoke_test and step % args.save_every == 0:
@@ -639,6 +755,7 @@ def run_training() -> None:
                 barrier()
             if step >= target_steps:
                 break
+            previous_step_end = time.perf_counter()
         epoch += 1
 
     barrier()

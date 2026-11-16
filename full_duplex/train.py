@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import time
 from pathlib import Path
@@ -137,6 +138,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="allow custom Hugging Face model code; enabled automatically for LFM3",
+    )
+    parser.add_argument(
+        "--disable-lfm3-triton",
+        action="store_true",
+        help="use LFM3's PyTorch convolution fallback during validation",
     )
     parser.add_argument("--mimi-checkpoint")
     parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
@@ -438,6 +444,13 @@ def run_training() -> None:
     )
     model_start = time.perf_counter()
     model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
+    if args.disable_lfm3_triton:
+        temporal_module = importlib.import_module(model.transformer.__class__.__module__)
+        if not hasattr(temporal_module, "can_use_lfm3_conv"):
+            raise RuntimeError("the temporal model does not expose the LFM3 Triton selector")
+        temporal_module.can_use_lfm3_conv = lambda _hidden, _weight: False
+        if primary:
+            print("LFM3 Triton convolution disabled; using PyTorch fallback", flush=True)
     model.train()
     model_seconds = time.perf_counter() - model_start
 

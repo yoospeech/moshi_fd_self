@@ -8,7 +8,7 @@ python train_full_duplex.py \
   --folders '/home/ysw/Documents/DB/libriTTS/LibriTTS_R:en' \
   --alignment-mode online \
   --alignment-model medium --alignment-device cuda:0 \
-  --model models/LFM3-1.7B --trust-remote-code \
+  --model models/LFM3-1.7B --trust-remote-code --disable-lfm3-triton \
   --num-codebooks 4 \
   --assistant-text-delay-steps 0 --acoustic-delay 1 \
   --depformer-dim 1024 --depformer-heads 16 \

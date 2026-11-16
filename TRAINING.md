@@ -36,7 +36,7 @@ manifest is created.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH=. \
 /data/util/anaconda3/envs/duplexomni/bin/python train_full_duplex.py \
   --task mono_post_training \

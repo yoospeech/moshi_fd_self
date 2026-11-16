@@ -21,7 +21,10 @@ from torch import nn
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers import PretrainedConfig as PreTrainedConfig
+try:
+    from transformers import PreTrainedConfig
+except ImportError:  # transformers < 5
+    from transformers import PretrainedConfig as PreTrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.integrations import (
     use_kernel_forward_from_hub,

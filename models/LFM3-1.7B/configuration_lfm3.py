@@ -13,7 +13,10 @@
 # limitations under the License.
 from huggingface_hub.dataclasses import strict
 
-from transformers import PretrainedConfig as PreTrainedConfig
+try:
+    from transformers import PreTrainedConfig
+except ImportError:  # transformers < 5
+    from transformers import PretrainedConfig as PreTrainedConfig
 from transformers.utils import auto_docstring
 
 

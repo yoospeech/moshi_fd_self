@@ -358,6 +358,14 @@ class MonoContinuationDataset(StereoDialogueDataset):
         self.frame_rate = frame_rate
         self.text_padding_id = text_padding_id
         self.text_epad_id = text_epad_id
+        self.online_alignment = online_alignment
+        self.whisper_model = whisper_model
+        self.alignment_device = alignment_device
+        self.min_prefix_seconds = min_prefix_seconds
+        self.min_suffix_seconds = min_suffix_seconds
+        self.gap_seconds = gap_seconds
+        self.seed = seed
+        self._alignment_model: Any | None = None
         self.original_size = 0
         self.entries: list[dict[str, Any]] = []
         self.rejected = {"duration": 0, "split": 0, "alignment": 0, "text_collision": 0}
@@ -385,55 +393,8 @@ class MonoContinuationDataset(StereoDialogueDataset):
             raw_entries = entries
         self.timing_stats["discovery_seconds"] = time.perf_counter() - discovery_start
         self.original_size = len(raw_entries)
-        if online_alignment:
-            if folders is None:
-                raise ValueError("online alignment requires folders with explicit languages")
-            # Run in the training process before DataLoader workers start. Never
-            # retain Whisper in the dataset sent to worker processes.
-            from scripts import annotate
-            from types import SimpleNamespace
-            import logging
-            model = None
-            try:
-                for entry in raw_entries:
-                    if not min_duration <= float(entry["duration"]) <= max_duration:
-                        continue
-                    try:
-                        words = self._load_alignments(entry)
-                        if words:
-                            self._validate_alignments(words, float(entry["duration"]))
-                            self.timing_stats["alignment_reused"] += 1
-                            continue
-                    except (OSError, ValueError, KeyError, TypeError):
-                        pass
-                    if model is None:
-                        model_load_start = time.perf_counter()
-                        model = annotate.whisper.load_model(whisper_model, device=alignment_device)
-                        self.timing_stats["alignment_model_load_seconds"] = (
-                            time.perf_counter() - model_load_start
-                        )
-                    try:
-                        alignment_start = time.perf_counter()
-                        result = annotate.process_one(
-                            Path(entry["path"]), None, entry["language"], model,
-                            SimpleNamespace(keep_silence_in_segments=1.0),
-                        )
-                        self.timing_stats["alignment_extracted"] += 1
-                        entry["alignments"] = result["alignments"]
-                    except (torch.cuda.OutOfMemoryError, MemoryError):
-                        raise
-                    except Exception:
-                        self.timing_stats["alignment_failed"] += 1
-                        logging.getLogger(__name__).exception("Alignment failed: %s", entry["path"])
-                        entry["alignments"] = []
-                    finally:
-                        self.timing_stats["alignment_inference_seconds"] += time.perf_counter() - alignment_start
-            finally:
-                del model
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        if online_alignment and folders is None:
+            raise ValueError("online alignment requires folders with explicit languages")
         filter_start = time.perf_counter()
         for index, entry in enumerate(raw_entries):
             duration = float(entry["duration"])
@@ -445,7 +406,15 @@ class MonoContinuationDataset(StereoDialogueDataset):
                 if alignments:
                     alignments = self._validate_alignments(alignments, duration)
             except (OSError, ValueError, KeyError, TypeError):
-                self.rejected["alignment"] += 1
+                if online_alignment:
+                    alignments = None
+                else:
+                    self.rejected["alignment"] += 1
+                    continue
+            if not alignments and online_alignment:
+                # Keep unannotated samples and prepare them lazily when the
+                # DataLoader first asks for the item.
+                self.entries.append({**entry, "duration": duration, "alignments": None})
                 continue
             if not alignments:
                 self.rejected["alignment"] += 1
@@ -486,6 +455,74 @@ class MonoContinuationDataset(StereoDialogueDataset):
                     "word-alignment sidecars are missing (run annotate.py first)"
                 )
             raise ValueError(f"empty mono continuation dataset: {self.manifest or folders}")
+
+    def _extract_alignment(self, entry: dict[str, Any]) -> list[Any]:
+        """Run Whisper for one item on first DataLoader access."""
+        from scripts import annotate
+        from types import SimpleNamespace
+
+        if self._alignment_model is None:
+            model_load_start = time.perf_counter()
+            self._alignment_model = annotate.whisper.load_model(
+                self.whisper_model, device=self.alignment_device
+            )
+            self.timing_stats["alignment_model_load_seconds"] += (
+                time.perf_counter() - model_load_start
+            )
+        alignment_start = time.perf_counter()
+        try:
+            result = annotate.process_one(
+                Path(entry["path"]), None, entry["language"], self._alignment_model,
+                SimpleNamespace(keep_silence_in_segments=1.0),
+            )
+            alignments = self._validate_alignments(
+                result["alignments"], float(entry["duration"])
+            )
+            if not alignments:
+                raise ValueError("Whisper returned no word alignments")
+            self.timing_stats["alignment_extracted"] += 1
+            return alignments
+        except (torch.cuda.OutOfMemoryError, MemoryError):
+            raise
+        except Exception:
+            self.timing_stats["alignment_failed"] += 1
+            raise
+        finally:
+            self.timing_stats["alignment_inference_seconds"] += (
+                time.perf_counter() - alignment_start
+            )
+
+    def _prepare_lazy_entry(self, index: int) -> dict[str, Any]:
+        entry = self.entries[index]
+        if entry.get("split_seconds") is not None:
+            return entry
+        if not self.online_alignment:
+            return entry
+        alignments = self._extract_alignment(entry)
+        random_value = self._random_value(self.seed, index, str(entry["path"]))
+        split = self._split_time(
+            float(entry["duration"]), alignments, random_value,
+            self.min_prefix_seconds, self.min_suffix_seconds,
+        )
+        if split is None:
+            raise ValueError(f"{entry['path']}: no usable word boundary for continuation split")
+        gap = self.gap_seconds[0] + random_value * (
+            self.gap_seconds[1] - self.gap_seconds[0]
+        )
+        suffix_alignments = [
+            [word, [float(times[0]) + gap, float(times[1]) + gap], speaker]
+            for word, times, speaker in alignments
+            if float(times[0]) >= split
+        ]
+        if self.tokenizer is not None:
+            self._aligned_text_stream(
+                suffix_alignments,
+                max(1, math.ceil((float(entry["duration"]) + gap) * self.frame_rate)),
+            )
+        entry.update(
+            alignments=alignments, split_seconds=split, gap_seconds=gap
+        )
+        return entry
 
     def _load_alignments(self, entry: dict[str, Any]) -> list[Any] | None:
         if "alignments" in entry:
@@ -549,7 +586,7 @@ class MonoContinuationDataset(StereoDialogueDataset):
 
     def render_stereo(self, index: int) -> tuple[torch.Tensor, torch.Tensor, list[Any] | None]:
         """Render a synthetic turn; stack as ``[assistant, user]`` for WAV."""
-        entry = self.entries[index]
+        entry = self._prepare_lazy_entry(index)
         audio_path = Path(entry["path"])
         if not audio_path.is_absolute():
             audio_path = self.root / audio_path

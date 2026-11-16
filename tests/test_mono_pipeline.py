@@ -47,10 +47,14 @@ class MonoPipelineTests(unittest.TestCase):
             with patch.dict('sys.modules', {'scripts.annotate': annotation}):
                 ds = MonoContinuationDataset(None, Tokenizer(), folders=directory + ':ko',
                     online_alignment=True, text_padding_id=10, text_epad_id=11)
+                self.assertFalse(annotation.process_one.called)
+                batch = collate_duplex([ds[0]])
+                ds[0]
             self.assertEqual(annotation.process_one.call_args.args[2], 'ko')
             self.assertIsNone(annotation.process_one.call_args.args[1])
+            self.assertEqual(annotation.whisper.load_model.call_count, 1)
+            self.assertEqual(annotation.process_one.call_count, 1)
             self.assertFalse(list(Path(directory).glob('*.json')))
-            batch = collate_duplex([ds[0]])
             self.assertEqual(batch['languages'], ['ko'])
             self.assertEqual(batch['waveforms'].shape, batch['assistant_waveforms'].shape)
 

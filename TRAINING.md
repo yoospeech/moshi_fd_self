@@ -62,9 +62,12 @@ PYTHONPATH=. \
 For multiple languages, use comma-separated folder and Whisper language-code
 pairs, for example `--folders '/data/ko:ko,/data/en:en,/data/hi:hi,/data/id:id'`.
 
-Online alignment runs during dataset initialization, before the first batch.
-Valid adjacent JSON sidecars are reused; missing or invalid alignments are
-extracted into memory and recomputed after restart. Empty alignments, invalid
+Online alignment runs lazily when the DataLoader first accesses each sample.
+The Whisper model is loaded on first use and kept in the training process;
+online alignment therefore uses `num_workers=0` and may use an
+`--alignment-device` such as `cuda:0`. Valid adjacent JSON sidecars are reused;
+missing or invalid alignments are extracted into memory and recomputed after
+restart. Empty alignments, invalid
 timestamps, unavailable word boundaries and BPE collisions are rejected.
 Use `--alignment-mode sidecar` to require pre-existing JSON files.
 

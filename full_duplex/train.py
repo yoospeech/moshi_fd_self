@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
     parser.add_argument("--alignment-mode", choices=("online", "sidecar"), default="online",
-                        help="extract missing word alignments during folder dataset initialization")
+                        help="extract missing word alignments lazily while loading folder samples")
     parser.add_argument("--alignment-model", default="medium")
     parser.add_argument("--alignment-device", default="cpu")
     parser.add_argument(
@@ -596,7 +596,14 @@ def run_training() -> None:
             batch_size=args.batch_size,
             shuffle=train_sampler is None,
             sampler=train_sampler,
-            num_workers=2,
+            # Lazy Whisper owns a model (and possibly a CUDA context), so it
+            # must run in this rank's training process rather than forked
+            # DataLoader workers. Prepared alignments remain cached in memory.
+            num_workers=0 if (
+                args.task == "mono_post_training"
+                and args.alignment_mode == "online"
+                and bool(args.folders)
+            ) else 2,
             pin_memory=device.type == "cuda",
             collate_fn=collate_duplex,
         )
@@ -604,7 +611,11 @@ def run_training() -> None:
             valid_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=0 if (
+                args.task == "mono_post_training"
+                and args.alignment_mode == "online"
+                and bool(args.folders)
+            ) else 2,
             pin_memory=device.type == "cuda",
             collate_fn=collate_duplex,
         )

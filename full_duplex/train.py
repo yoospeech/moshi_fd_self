@@ -177,6 +177,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--log-timing", action="store_true",
+                        help="print step timing at --log-every intervals")
     parser.add_argument("--tensorboard-dir")
     parser.add_argument("--valid-ratio", type=float, default=0.05)
     parser.add_argument("--valid-every", type=int, default=500)
@@ -752,15 +754,16 @@ def run_training() -> None:
                     f"{rq_log}",
                     flush=True,
                 )
-                print(
-                    f"timing step: data={data_seconds:.3f}s mimi={mimi_encode_seconds:.3f}s "
-                    f"train={train_seconds:.3f}s total={step_seconds:.3f}s | "
-                    f"avg: data={timing_totals['data']/timing_steps:.3f}s "
-                    f"mimi={timing_totals['mimi']/timing_steps:.3f}s "
-                    f"train={timing_totals['train']/timing_steps:.3f}s "
-                    f"total={timing_totals['step']/timing_steps:.3f}s",
-                    flush=True,
-                )
+                if args.log_timing:
+                    print(
+                        f"timing step: data={data_seconds:.3f}s mimi={mimi_encode_seconds:.3f}s "
+                        f"train={train_seconds:.3f}s total={step_seconds:.3f}s | "
+                        f"avg: data={timing_totals['data']/timing_steps:.3f}s "
+                        f"mimi={timing_totals['mimi']/timing_steps:.3f}s "
+                        f"train={timing_totals['train']/timing_steps:.3f}s "
+                        f"total={timing_totals['step']/timing_steps:.3f}s",
+                        flush=True,
+                    )
             if primary and not args.smoke_test and step % args.save_every == 0:
                 save_checkpoint(model, optimizer, step, Path(args.output))
             validate = valid_loader is not None and step % args.valid_every == 0

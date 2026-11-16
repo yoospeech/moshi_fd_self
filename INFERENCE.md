@@ -1,6 +1,6 @@
 # Moshi Inference Guide
 
-Return to [README](README.md). For training and checkpoints, see [TRAINING.md](TRAINING.md).
+Return to [README](README.md). For training, see [TRAINING.md](TRAINING.md).
 
 Inference encodes the selected user waveform with frozen Mimi, force-feeds
 the observed user codebooks, and autoregressively generates assistant text
@@ -40,18 +40,11 @@ timeline. Generation runs for the input-plus-tail duration. Text EOS latches
 text to PAD while audio continues on that fixed timeline.
 Increase the tail if the response is truncated.
 
-## Streams and checkpoint compatibility
+## Checkpoint compatibility
 
-The default four-codebook layout is:
-
-```text
-streams: [assistant_text, assistant_audio(q0..q3), user_audio(q0..q3)]
-delays:  [0,              0,1,1,1,                0,1,1,1]
-```
-
-Generation uses the delayed timeline, then undelays assistant codebooks before
-Mimi decoding. INIT occupies startup acoustic slots; out-of-range final slots
-are absent, matching training.
+The stream layout is defined in the [training guide](TRAINING.md#streams).
+Generation follows that delayed timeline and undelays assistant codebooks
+before Mimi decoding.
 
 The loader requires `text_context_mode: "moshi"` and the corresponding delay
 pattern. With four codebooks this is `[0,0,1,1,1,0,1,1,1]`, not the old
@@ -83,10 +76,5 @@ Reference decoding recomputes the Temporal prefix per frame and the Depth
 prefix per codebook. Streaming KV-cache decoding is not implemented, so long
 inputs can be slow.
 
-For LFM3 on GB10 (`sm_121a`), `--disable-lfm3-triton` selects the PyTorch
-causal-convolution fallback when Triton's bundled assembler does not recognize
-the GPU. This option does not establish overall LFM3 compatibility; the
-verified real-data training path currently uses SmolLM2-135M.
-
-Regression tests exercise inference/training parity, but a one-step training
-checkpoint is only useful for checking execution, not speech quality.
+For LFM3 environments where Triton's assembler does not recognize the GPU,
+`--disable-lfm3-triton` selects its PyTorch causal-convolution fallback.

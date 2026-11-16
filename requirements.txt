@@ -1,6 +1,6 @@
 torch>=2.2,<2.10
-transformers>=4.46,<5
-huggingface-hub>=0.24,<1
+transformers>=5.19,<6
+huggingface-hub>=1.31,<3
 safetensors>=0.8,<1
 sphn>=0.2,<0.3
 soundfile>=0.12,<1

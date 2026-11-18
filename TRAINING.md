@@ -24,6 +24,12 @@ while retaining assistant text targets. Use `0` for fully acoustic batches.
 
 ## Mono continuation post-training
 
+Duration limits apply to the original mono recording. `--min-words` and the
+words-per-second limits apply to the assistant suffix after splitting; its
+density is measured over the remaining audio duration plus the inserted gap.
+These filters also run after online alignment. Rejected lazy samples are replaced
+by the next valid sample; strict limits can exhaust a small dataset.
+
 `MonoContinuationDataset` turns one mono utterance into a synthetic turn:
 
 ```text

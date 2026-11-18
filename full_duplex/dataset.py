@@ -338,6 +338,9 @@ class MonoContinuationDataset(StereoDialogueDataset):
         text_epad_id: int,
         min_duration: float = 2.0,
         max_duration: float = 45.0,
+        min_words: int = 0,
+        min_words_per_second: float = 0.0,
+        max_words_per_second: float = float("inf"),
         min_prefix_seconds: float = 1.0,
         min_suffix_seconds: float = 1.0,
         gap_seconds: tuple[float, float] = (0.1, 0.5),
@@ -351,6 +354,10 @@ class MonoContinuationDataset(StereoDialogueDataset):
     ) -> None:
         if min_prefix_seconds <= 0 or min_suffix_seconds <= 0:
             raise ValueError("continuation prefix and suffix durations must be positive")
+        if min_words < 0:
+            raise ValueError("min_words must be non-negative")
+        if min_words_per_second < 0 or max_words_per_second < min_words_per_second:
+            raise ValueError("invalid words-per-second range")
         if gap_seconds[0] < 0 or gap_seconds[1] < gap_seconds[0]:
             raise ValueError("invalid continuation gap range")
         if sum(value is not None for value in (manifest, entries, folders)) != 1:
@@ -367,12 +374,22 @@ class MonoContinuationDataset(StereoDialogueDataset):
         self.alignment_device = alignment_device
         self.min_prefix_seconds = min_prefix_seconds
         self.min_suffix_seconds = min_suffix_seconds
+        self.min_words = min_words
+        self.min_words_per_second = min_words_per_second
+        self.max_words_per_second = max_words_per_second
         self.gap_seconds = gap_seconds
         self.seed = seed
         self._alignment_model: Any | None = None
         self.original_size = 0
         self.entries: list[dict[str, Any]] = []
-        self.rejected = {"duration": 0, "split": 0, "alignment": 0, "text_collision": 0}
+        self.rejected = {
+            "duration": 0,
+            "words": 0,
+            "words_per_second": 0,
+            "split": 0,
+            "alignment": 0,
+            "text_collision": 0,
+        }
         timing_start = time.perf_counter()
         self.timing_stats: dict[str, float | int] = {
             "discovery_seconds": 0.0,
@@ -436,6 +453,12 @@ class MonoContinuationDataset(StereoDialogueDataset):
                 for word, times, speaker in alignments
                 if float(times[0]) >= split
             ]
+            rejection = self._suffix_rejection(
+                suffix_alignments, duration=duration, split=split, gap=gap
+            )
+            if rejection is not None:
+                self.rejected[rejection] += 1
+                continue
             try:
                 # Audio-only exporters pass None; training always supplies its tokenizer.
                 if self.tokenizer is not None:
@@ -523,6 +546,17 @@ class MonoContinuationDataset(StereoDialogueDataset):
             for word, times, speaker in alignments
             if float(times[0]) >= split
         ]
+        rejection = self._suffix_rejection(
+            suffix_alignments,
+            duration=float(entry["duration"]),
+            split=split,
+            gap=gap,
+        )
+        if rejection is not None:
+            self.rejected[rejection] += 1
+            raise RecoverableSampleError(
+                f"{entry['path']}: continuation suffix rejected by {rejection} filter"
+            )
         if self.tokenizer is not None:
             try:
                 self._aligned_text_stream(
@@ -536,6 +570,27 @@ class MonoContinuationDataset(StereoDialogueDataset):
             alignments=alignments, split_seconds=split, gap_seconds=gap
         )
         return entry
+
+    def _suffix_rejection(
+        self,
+        suffix_alignments: list[Any],
+        *,
+        duration: float,
+        split: float,
+        gap: float,
+    ) -> str | None:
+        """Apply text-density filters to the assistant continuation target."""
+        word_count = len(suffix_alignments)
+        if word_count < self.min_words:
+            return "words"
+        # The assistant target occupies the inserted gap plus the remaining
+        # source duration, so use that complete target window for WPS just as
+        # StereoDialogueDataset uses the complete stereo sample duration.
+        suffix_duration = duration - split + gap
+        words_per_second = word_count / suffix_duration
+        if not self.min_words_per_second <= words_per_second <= self.max_words_per_second:
+            return "words_per_second"
+        return None
 
     def _load_alignments(self, entry: dict[str, Any]) -> list[Any] | None:
         if "alignments" in entry:

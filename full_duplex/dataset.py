@@ -203,7 +203,7 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
         return len(self.entries)
 
     def _word_tokens(self, word: str) -> list[int]:
-        # Preserve SmolLM2's word-boundary BPE form for every aligned word.
+        # Preserve the tokenizer's word-boundary form for every aligned word.
         return self.tokenizer.encode(" " + word, add_special_tokens=False)
 
     def _lexical_token_count(self, alignments: list[Any]) -> int:

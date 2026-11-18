@@ -99,7 +99,8 @@ PYTHONPATH=. python train_full_duplex.py \
 
 Relative WAV paths resolve from the manifest directory. Channel defaults are
 assistant 0 and user 1, and can be overridden per manifest row. Filtering
-checks duration, word rate, timestamps, speech coverage and BPE collisions.
+checks duration, minimum assistant BPE tokens, timestamps, speech coverage and
+BPE frame collisions.
 
 ## Model and distributed execution
 

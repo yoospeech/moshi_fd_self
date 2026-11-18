@@ -17,7 +17,7 @@ from full_duplex.model import (
 from full_duplex.inference import (
     generate_assistant_text, generate_assistant, load_config,
 )
-from full_duplex.train import acoustic_prompt_mask, resolve_model_source
+from full_duplex.train import mask_audio_batch_text, resolve_model_source, text_only_streams
 from moshi.models.lm_utils import _delay_sequence
 
 
@@ -41,10 +41,10 @@ class AlignmentTests(unittest.TestCase):
                     min_speech_coverage=0, max_speech_coverage=1,
                 )
 
-    def test_mono_continuation_keeps_prefix_and_suffix_on_separate_streams(self):
+    def test_mono_training_uses_full_audio_without_user_prompt(self):
         class Tokenizer:
             def encode(self, text, **kwargs):
-                return {" world": [7]}[text]
+                return {" hello": [6], " world": [7], "hello world": [6, 7]}[text]
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -60,13 +60,25 @@ class AlignmentTests(unittest.TestCase):
             audio = torch.linspace(-1, 1, 96000, dtype=torch.float32).numpy()
             with patch("full_duplex.dataset.sphn.read", return_value=(audio, 24000)):
                 item = dataset[0]
-            split = round(dataset.entries[0]["split_seconds"] * 24000)
-            gap = round(dataset.entries[0]["gap_seconds"] * 24000)
-            self.assertEqual(dataset.entries[0]["split_seconds"], 2)
-            self.assertTrue((item["waveform"][split:] == 0).all())
-            self.assertTrue((item["assistant_waveform"][: split + gap] == 0).all())
-            self.assertTrue((item["assistant_waveform"][split + gap :] == torch.from_numpy(audio[split:])).all())
+            self.assertTrue((item["waveform"] == 0).all())
+            self.assertTrue((item["assistant_waveform"] == torch.from_numpy(audio)).all())
+            self.assertIn(6, item["assistant_text_tokens"].tolist())
             self.assertIn(7, item["assistant_text_tokens"].tolist())
+
+    def test_audio_text_mask_preserves_epad_and_original_targets(self):
+        streams = torch.full((1, 9, 5), -1, dtype=torch.long)
+        streams[0, 0] = torch.tensor([10, 11, 3, 4, 10])
+        masked, targets = mask_audio_batch_text(
+            streams, padding_id=10, epad_id=11, probability=1.0
+        )
+        self.assertEqual(masked[0, 0].tolist(), [10, 11, 10, 10, 10])
+        self.assertEqual(targets[0, 0].tolist(), [10, 11, 3, 4, 10])
+
+    def test_text_only_stream_uses_entire_batch_and_no_audio(self):
+        batch = {"text_only_tokens": torch.tensor([[1, 2, -1], [3, 4, 5]])}
+        streams = text_only_streams(batch, torch.device("cpu"), FullDuplexConfig())
+        self.assertEqual(streams[:, 0].tolist(), [[1, 2, -1], [3, 4, 5]])
+        self.assertTrue((streams[:, 1:] == -1).all())
 
     def test_manifest_target_and_audio_channel(self):
         class Tokenizer:
@@ -127,12 +139,6 @@ class ModelTests(unittest.TestCase):
             torch.testing.assert_close(
                 delayed[0, stream, 1:], raw[0, stream, :-1]
             )
-
-    def test_half_batch_is_text_only(self):
-        torch.manual_seed(7)
-        mask = acoustic_prompt_mask(4, 0.5, device="cpu")
-        self.assertEqual(mask.sum().item(), 2)
-        self.assertEqual((~mask).sum().item(), 2)
 
     def test_models_directory_aliases(self):
         with tempfile.TemporaryDirectory() as directory:

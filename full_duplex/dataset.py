@@ -293,6 +293,11 @@ def collate_duplex(batch: list[dict[str, Any]]) -> dict[str, Any]:
     assistant_text_tokens = torch.full(
         (len(batch), max_assistant_text_frames), -1, dtype=torch.long
     )
+    dense_text = [item.get("text_only_tokens", item["assistant_text_tokens"]) for item in batch]
+    max_text_only_tokens = max(tokens.numel() for tokens in dense_text)
+    text_only_tokens = torch.full(
+        (len(batch), max_text_only_tokens), -1, dtype=torch.long
+    )
     for index, item in enumerate(batch):
         sample_length = item["waveform"].numel()
         waveforms[index, 0, :sample_length] = item["waveform"]
@@ -300,30 +305,35 @@ def collate_duplex(batch: list[dict[str, Any]]) -> dict[str, Any]:
         assistant_text_tokens[index, : item["assistant_text_frame_length"]] = item[
             "assistant_text_tokens"
         ]
+        text_only_tokens[index, : dense_text[index].numel()] = dense_text[index]
     return {
         "waveforms": waveforms,
         "assistant_waveforms": assistant_waveforms,
         "assistant_text_tokens": assistant_text_tokens,
+        "text_only_tokens": text_only_tokens,
         "audio_frame_lengths": torch.tensor(
             [item["audio_frame_length"] for item in batch], dtype=torch.long
         ),
         "assistant_text_frame_lengths": torch.tensor(
             [item["assistant_text_frame_length"] for item in batch], dtype=torch.long
         ),
+        "user_audio_present": torch.tensor(
+            [item.get("user_audio_present", True) for item in batch], dtype=torch.bool
+        ),
         "ids": [item["id"] for item in batch],
         "languages": [item.get("language", "unknown") for item in batch],
     }
 
 
-class MonoContinuationDataset(StereoDialogueDataset):
-    """Turn mono speech into a synthetic ``user prefix -> assistant suffix`` turn.
+class MonoPostTrainingDataset(StereoDialogueDataset):
+    """Train assistant audio/text on a complete mono utterance.
 
     The manifest is JSONL with at least ``path`` and ``duration``. Put word
     alignments inline as ``alignments``, point to a JSON sidecar with
     ``alignment_path``, or place a sidecar next to the WAV (``0.wav`` ->
     ``0.json``). An alignment uses the existing ``[word, [start, end],
     speaker]`` schema. By default, samples without alignment are rejected so
-    the split can never cut through a word.
+    every lexical target can be placed on the audio timeline.
     """
 
     def __init__(
@@ -349,15 +359,11 @@ class MonoContinuationDataset(StereoDialogueDataset):
         whisper_model: str = "medium",
         alignment_device: str = "cpu",
     ) -> None:
-        if min_prefix_seconds <= 0 or min_suffix_seconds <= 0:
-            raise ValueError("continuation prefix and suffix durations must be positive")
         if min_text_tokens < 0:
             raise ValueError("min_text_tokens must be non-negative")
         if min_text_tokens and tokenizer is None:
             raise ValueError("min_text_tokens requires a tokenizer")
         self.min_text_tokens = min_text_tokens
-        if gap_seconds[0] < 0 or gap_seconds[1] < gap_seconds[0]:
-            raise ValueError("invalid continuation gap range")
         if sum(value is not None for value in (manifest, entries, folders)) != 1:
             raise ValueError("provide exactly one of manifest, entries, or folders")
         self.manifest = Path(manifest) if manifest is not None else None
@@ -370,9 +376,6 @@ class MonoContinuationDataset(StereoDialogueDataset):
         self.online_alignment = online_alignment
         self.whisper_model = whisper_model
         self.alignment_device = alignment_device
-        self.min_prefix_seconds = min_prefix_seconds
-        self.min_suffix_seconds = min_suffix_seconds
-        self.gap_seconds = gap_seconds
         self.seed = seed
         self._alignment_model: Any | None = None
         self.original_size = 0
@@ -380,7 +383,6 @@ class MonoContinuationDataset(StereoDialogueDataset):
         self.rejected = {
             "duration": 0,
             "text_tokens": 0,
-            "split": 0,
             "alignment": 0,
             "text_collision": 0,
         }
@@ -434,45 +436,29 @@ class MonoContinuationDataset(StereoDialogueDataset):
             if not alignments:
                 self.rejected["alignment"] += 1
                 continue
-            random_value = self._random_value(seed, index, str(entry["path"]))
-            split = self._split_time(
-                duration, alignments, random_value, min_prefix_seconds, min_suffix_seconds
-            )
-            if split is None:
-                self.rejected["split"] += 1
-                continue
-            gap = gap_seconds[0] + random_value * (gap_seconds[1] - gap_seconds[0])
-            suffix_alignments = [
-                [word, [float(times[0]) + gap, float(times[1]) + gap], speaker]
-                for word, times, speaker in alignments
-                if float(times[0]) >= split
-            ]
             try:
                 # Audio-only exporters pass None; training always supplies its tokenizer.
-                self._check_suffix_tokens(suffix_alignments, str(entry["path"]))
+                self._check_text_tokens(alignments, str(entry["path"]))
                 if self.tokenizer is not None:
                     self._aligned_text_stream(
-                        suffix_alignments, max(1, math.ceil((duration + gap) * self.frame_rate))
+                        alignments, max(1, math.ceil(duration * self.frame_rate))
                     )
             except RecoverableSampleError:
                 continue
             except TextAlignmentCollision:
                 self.rejected["text_collision"] += 1
                 continue
-            self.entries.append(
-                {**entry, "duration": duration, "split_seconds": split,
-                 "gap_seconds": gap, "alignments": alignments}
-            )
+            self.entries.append({**entry, "duration": duration, "alignments": alignments})
         self.timing_stats["filter_seconds"] = time.perf_counter() - filter_start
         self.timing_stats["total_seconds"] = time.perf_counter() - timing_start
         self.filtered_hours = sum(float(entry["duration"]) for entry in self.entries) / 3600
         if not self.entries:
             if self.rejected["alignment"] == self.original_size:
                 raise ValueError(
-                    f"empty mono continuation dataset ({self.manifest or folders}); "
+                    f"empty mono post-training dataset ({self.manifest or folders}); "
                     "word-alignment sidecars are missing (run annotate.py first)"
                 )
-            raise ValueError(f"empty mono continuation dataset: {self.manifest or folders}")
+            raise ValueError(f"empty mono post-training dataset: {self.manifest or folders}")
 
     def _extract_alignment(self, entry: dict[str, Any]) -> list[Any]:
         """Run Whisper for one item on first DataLoader access."""
@@ -514,45 +500,25 @@ class MonoContinuationDataset(StereoDialogueDataset):
 
     def _prepare_lazy_entry(self, index: int) -> dict[str, Any]:
         entry = self.entries[index]
-        if entry.get("split_seconds") is not None:
+        if entry.get("alignments") is not None:
             return entry
         if not self.online_alignment:
             return entry
         alignments = self._extract_alignment(entry)
-        random_value = self._random_value(self.seed, index, str(entry["path"]))
-        split = self._split_time(
-            float(entry["duration"]), alignments, random_value,
-            self.min_prefix_seconds, self.min_suffix_seconds,
-        )
-        if split is None:
-            self.rejected["split"] += 1
-            raise RecoverableSampleError(
-                f"{entry['path']}: no usable word boundary for continuation split"
-            )
-        gap = self.gap_seconds[0] + random_value * (
-            self.gap_seconds[1] - self.gap_seconds[0]
-        )
-        suffix_alignments = [
-            [word, [float(times[0]) + gap, float(times[1]) + gap], speaker]
-            for word, times, speaker in alignments
-            if float(times[0]) >= split
-        ]
-        self._check_suffix_tokens(suffix_alignments, str(entry["path"]))
+        self._check_text_tokens(alignments, str(entry["path"]))
         if self.tokenizer is not None:
             try:
                 self._aligned_text_stream(
-                    suffix_alignments,
-                    max(1, math.ceil((float(entry["duration"]) + gap) * self.frame_rate)),
+                    alignments,
+                    max(1, math.ceil(float(entry["duration"]) * self.frame_rate)),
                 )
             except TextAlignmentCollision as error:
                 self.rejected["text_collision"] += 1
                 raise RecoverableSampleError(f"{entry['path']}: {error}") from error
-        entry.update(
-            alignments=alignments, split_seconds=split, gap_seconds=gap
-        )
+        entry.update(alignments=alignments)
         return entry
 
-    def _check_suffix_tokens(self, alignments: list[Any], path: str) -> None:
+    def _check_text_tokens(self, alignments: list[Any], path: str) -> None:
         if not self.min_text_tokens:
             return
         # Match the word-by-word encoding used by _aligned_text_stream;
@@ -561,9 +527,16 @@ class MonoContinuationDataset(StereoDialogueDataset):
         if count < self.min_text_tokens:
             self.rejected["text_tokens"] += 1
             raise RecoverableSampleError(
-                f"{path}: continuation suffix rejected by text_tokens filter "
+                f"{path}: mono transcript rejected by text_tokens filter "
                 f"(text_tokens={count}, min_text_tokens={self.min_text_tokens})"
             )
+
+    def _dense_text_tokens(self, alignments: list[Any]) -> torch.Tensor:
+        text = " ".join(str(word) for word, _timestamps, _speaker in alignments)
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        if isinstance(tokens, dict):
+            tokens = tokens["input_ids"]
+        return torch.tensor(tokens, dtype=torch.long)
 
     def _load_alignments(self, entry: dict[str, Any]) -> list[Any] | None:
         if "alignments" in entry:
@@ -626,7 +599,7 @@ class MonoContinuationDataset(StereoDialogueDataset):
         return min(boundaries, key=lambda value: abs(value - desired)) if boundaries else None
 
     def render_stereo(self, index: int) -> tuple[torch.Tensor, torch.Tensor, list[Any] | None]:
-        """Render a synthetic turn; stack as ``[assistant, user]`` for WAV."""
+        """Render complete mono speech as assistant audio with no user prompt."""
         entry = self._prepare_lazy_entry(index)
         audio_path = Path(entry["path"])
         if not audio_path.is_absolute():
@@ -637,40 +610,35 @@ class MonoContinuationDataset(StereoDialogueDataset):
         if wav.ndim != 1:
             raise ValueError(f"{audio_path}: mono post-training expects mono audio")
         source = torch.from_numpy(wav).float().clamp(-1.0, 1.0)
-        split_samples = min(source.numel(), round(float(entry["split_seconds"]) * self.sample_rate))
-        gap_samples = round(float(entry["gap_seconds"]) * self.sample_rate)
-        total_samples = source.numel() + gap_samples
-        user = torch.zeros(total_samples, dtype=torch.float32)
-        assistant = torch.zeros(total_samples, dtype=torch.float32)
-        user[:split_samples] = source[:split_samples]
-        assistant[split_samples + gap_samples :] = source[split_samples:]
+        user = torch.zeros_like(source)
+        assistant = source
         alignments = entry["alignments"]
         if alignments is None:
             return user, assistant, None
-        split = float(entry["split_seconds"])
-        gap = float(entry["gap_seconds"])
-        suffix_alignments = [
-            [word, [float(times[0]) + gap, float(times[1]) + gap], speaker]
-            for word, times, speaker in alignments
-            if float(times[0]) >= split
-        ]
-        return user, assistant, suffix_alignments
+        return user, assistant, alignments
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        user, assistant, suffix_alignments = self.render_stereo(index)
+        user, assistant, alignments = self.render_stereo(index)
         frame_length = max(1, math.ceil(user.numel() / (self.sample_rate / self.frame_rate)))
-        if suffix_alignments is None:
+        if alignments is None:
             assistant_text_tokens = torch.full(
                 (frame_length,), self.text_padding_id, dtype=torch.long
             )
         else:
-            assistant_text_tokens = self._aligned_text_stream(suffix_alignments, frame_length)
+            assistant_text_tokens = self._aligned_text_stream(alignments, frame_length)
+        text_only_tokens = self._dense_text_tokens(alignments or [])
         return {
             "id": f"{Path(self.entries[index]['path']).stem}-{index}",
             "language": self.entries[index].get("language", "unknown"),
             "waveform": user,
             "assistant_waveform": assistant,
             "assistant_text_tokens": assistant_text_tokens,
+            "text_only_tokens": text_only_tokens,
             "audio_frame_length": frame_length,
             "assistant_text_frame_length": assistant_text_tokens.numel(),
+            "user_audio_present": False,
         }
+
+
+# Keep older preparation/export scripts import-compatible.
+MonoContinuationDataset = MonoPostTrainingDataset

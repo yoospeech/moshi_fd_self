@@ -49,9 +49,9 @@ class TrainingObjective(nn.Module):
         self.audio_loss_weight = audio_loss_weight
         self.semantic_loss_weight = semantic_loss_weight
 
-    def forward(self, streams):
+    def forward(self, streams, text_targets=None, predict_audio=True):
         text_logits, text_mask, audio_logits, audio_mask = self.model.forward_training(
-            streams, predict_audio=self.audio_loss_weight > 0
+            streams, predict_audio=predict_audio and self.audio_loss_weight > 0
         )
         return masked_multistream_loss(
             text_logits, text_mask, streams,
@@ -62,4 +62,5 @@ class TrainingObjective(nn.Module):
             audio_mask=audio_mask,
             audio_loss_weight=self.audio_loss_weight,
             semantic_loss_weight=self.semantic_loss_weight,
+            text_targets=text_targets,
         )

@@ -91,11 +91,11 @@ class MonoPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MonoContinuationDataset._validate_alignments([['word', [0, float('nan')], 'S']], 4)
 
-    def test_minimum_suffix_bpe_tokens_eager_and_online(self):
+    def test_minimum_mono_bpe_tokens_eager_and_online(self):
         for lazy in (False, True):
             for count in (4, 5):
                 with self.subTest(lazy=lazy, tokens=count):
-                    words = [['prefix', [0, 2], 'S'], ['suffix', [2, 4], 'S']]
+                    words = [['utterance', [0, 4], 'S']]
                     tokenizer = Mock()
                     tokenizer.encode.return_value = list(range(20, 20 + count))
                     entry = {'path': 'sample.wav', 'duration': 4, 'language': 'en',
@@ -103,8 +103,7 @@ class MonoPipelineTests(unittest.TestCase):
                     kwargs = dict(text_padding_id=10, text_epad_id=11,
                                   min_text_tokens=5, gap_seconds=(0, 0))
                     with patch('full_duplex.dataset.discover_mono_continuation_entries',
-                               return_value=([entry], {})), patch.object(
-                                   MonoContinuationDataset, '_split_time', return_value=2):
+                               return_value=([entry], {})):
                         if lazy:
                             ds = MonoContinuationDataset(None, tokenizer, folders='unused:en',
                                                          online_alignment=True, **kwargs)
@@ -117,9 +116,9 @@ class MonoPipelineTests(unittest.TestCase):
                                 else:
                                     ds._prepare_lazy_entry(0)
                         elif count < 5:
-                            with self.assertRaisesRegex(ValueError, 'empty mono continuation dataset'):
+                            with self.assertRaisesRegex(ValueError, 'empty mono post-training dataset'):
                                 MonoContinuationDataset(None, tokenizer, entries=[entry], **kwargs)
                         else:
                             ds = MonoContinuationDataset(None, tokenizer, entries=[entry], **kwargs)
                             self.assertEqual(len(ds), 1)
-                        tokenizer.encode.assert_any_call(' suffix', add_special_tokens=False)
+                        tokenizer.encode.assert_any_call(' utterance', add_special_tokens=False)

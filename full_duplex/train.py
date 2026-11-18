@@ -24,7 +24,7 @@ from .model import (
 )
 from .dataset import (
     StereoDialogueDataset,
-    MonoContinuationDataset,
+    MonoPostTrainingDataset,
     RecoverableSampleError,
     collate_duplex,
 )
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task", choices=("mono_post_training", "finetuning"), default="finetuning",
-        help="mono_post_training splits mono speech; finetuning reads stereo dialogue",
+        help="mono_post_training trains full mono utterances as assistant; finetuning reads stereo dialogue",
     )
     parser.add_argument("--continuation-min-prefix-seconds", type=float, default=1.0)
     parser.add_argument("--continuation-min-suffix-seconds", type=float, default=1.0)
@@ -151,7 +151,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--text-only-fraction", type=float, default=0.5,
-        help="fraction of each training batch with audio removed (default: 0.5)",
+        help="probability that a complete mono batch uses dense text only (default: 0.5)",
+    )
+    parser.add_argument(
+        "--audio-text-mask-probability", type=float, default=0.3,
+        help="probability of masking each non-PAD aligned text token in an audio batch",
     )
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
@@ -201,10 +205,19 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def save_checkpoint(model: MoshiFullDuplexModel, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
+def save_checkpoint(
+    model: MoshiFullDuplexModel,
+    optimizers: dict[str, torch.optim.Optimizer],
+    step: int,
+    output: Path,
+) -> None:
     output.mkdir(parents=True, exist_ok=True)
     torch.save(
-        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
+        {
+            "model": model.state_dict(),
+            "optimizers": {name: optimizer.state_dict() for name, optimizer in optimizers.items()},
+            "step": step,
+        },
         output / f"checkpoint_{step:08d}.pt",
     )
     (output / "config.json").write_text(json.dumps(model.checkpoint_metadata(), indent=2), encoding="utf-8")
@@ -276,6 +289,10 @@ def online_streams(
     assistant_waveforms = batch["assistant_waveforms"].to(  # type: ignore[union-attr]
         mimi_device, non_blocking=True
     )
+    user_audio_present = batch.get(
+        "user_audio_present",
+        torch.ones(waveforms.shape[0], dtype=torch.bool),
+    ).to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
     combined_codes = mimi.encode(torch.cat([waveforms, assistant_waveforms], dim=0)).to(device)
     audio_codes, assistant_codes = combined_codes.chunk(2, dim=0)
     if audio_codes.shape[1] != config.num_codebooks:
@@ -313,15 +330,50 @@ def online_streams(
         streams[
             index, 0, assistant_text_frames : assistant_text_frames + tail
         ] = config.text_padding_id
+        # Text-only samples omit assistant audio inputs and loss targets,
+        # including when the dataset has no user prompt.
         if acoustic_mask[index]:
             valid_assistant_frames = min(audio_frames, assistant_codes.shape[-1])
             streams[index, 1 : 1 + config.num_codebooks, :valid_assistant_frames] = assistant_codes[
                 index, :, :valid_assistant_frames
             ]
+        if acoustic_mask[index] and user_audio_present[index]:
             streams[index, 1 + config.num_codebooks :, :valid_audio_frames] = audio_codes[
                 index, :, :valid_audio_frames
             ]
     return streams
+
+
+def text_only_streams(
+    batch: dict[str, object], device: torch.device, config: FullDuplexConfig
+) -> torch.Tensor:
+    """Build one full dense-text batch from the same continuous mono dataset."""
+    tokens = batch["text_only_tokens"].to(device, non_blocking=True)  # type: ignore[union-attr]
+    frames = min(tokens.shape[1], config.context)
+    streams = torch.full(
+        (tokens.shape[0], 1 + 2 * config.num_codebooks, frames),
+        -1, dtype=torch.long, device=device,
+    )
+    streams[:, 0] = tokens[:, :frames]
+    return streams
+
+
+def mask_audio_batch_text(
+    streams: torch.Tensor,
+    *,
+    padding_id: int,
+    epad_id: int,
+    probability: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask lexical text inputs while preserving EPAD timing and LM targets."""
+    targets = streams[:, :1].clone()
+    if probability == 0:
+        return streams, targets
+    candidates = (targets != -1) & (targets != padding_id) & (targets != epad_id)
+    selected = candidates & (torch.rand(targets.shape, device=streams.device) < probability)
+    masked = streams.clone()
+    masked[:, :1][selected] = padding_id
+    return masked, targets
 
 
 @torch.no_grad()
@@ -384,8 +436,8 @@ def run_training() -> None:
     args = parse_args()
     if not 0.0 <= args.text_only_fraction <= 1.0:
         raise ValueError("text-only-fraction must be between 0 and 1")
-    if args.text_only_fraction > 0 and args.batch_size < 2:
-        raise ValueError("batch-size must be at least 2 when mixing text-only samples")
+    if not 0.0 <= args.audio_text_mask_probability <= 1.0:
+        raise ValueError("audio-text-mask-probability must be between 0 and 1")
     for name in ("batch_size", "grad_accum", "steps", "smoke_steps", "log_every", "save_every", "valid_every"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
@@ -515,14 +567,20 @@ def run_training() -> None:
     temporal_parameters = list(model.transformer.parameters())
     temporal_ids = {id(parameter) for parameter in temporal_parameters}
     new_parameters = [parameter for parameter in model.parameters() if id(parameter) not in temporal_ids]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": temporal_parameters, "lr": args.temporal_learning_rate},
-            {"params": new_parameters, "lr": args.learning_rate},
-        ],
-        betas=(0.9, 0.95),
-        weight_decay=0.1,
-    )
+    def make_optimizer() -> torch.optim.AdamW:
+        return torch.optim.AdamW(
+            [
+                {"params": temporal_parameters, "lr": args.temporal_learning_rate},
+                {"params": new_parameters, "lr": args.learning_rate},
+            ],
+            betas=(0.9, 0.95),
+            weight_decay=0.1,
+        )
+
+    optimizers = {
+        "audio": make_optimizer(),
+        "text": make_optimizer(),
+    }
 
     if args.smoke_test:
         # Valid DSM controls plus random Mimi codes. This checks the complete
@@ -552,17 +610,14 @@ def run_training() -> None:
                 raise SystemExit(
                     "mono_post_training requires --folders or --manifest unless --smoke-test is used"
                 )
-            dataset = MonoContinuationDataset(
+            dataset = MonoPostTrainingDataset(
                 dataset_source, tokenizer, folders=args.folders, max_files=args.max_files,
                 online_alignment=bool(args.folders) and args.alignment_mode == "online",
                 whisper_model=args.alignment_model, alignment_device=args.alignment_device,
                 sample_rate=24000, frame_rate=config.frame_rate,
                 text_padding_id=config.text_padding_id, text_epad_id=config.text_epad_id,
                 min_duration=args.min_duration, max_duration=args.max_duration,
-                min_prefix_seconds=args.continuation_min_prefix_seconds,
                 min_text_tokens=args.min_text_tokens,
-                min_suffix_seconds=args.continuation_min_suffix_seconds,
-                gap_seconds=(args.continuation_min_gap_seconds, args.continuation_max_gap_seconds),
                 seed=args.seed,
             )
             if dataset.discovery_stats is not None:
@@ -669,9 +724,12 @@ def run_training() -> None:
         batches = loader
         target_steps = args.steps
 
-    optimizer.zero_grad(set_to_none=True)
+    for optimizer in optimizers.values():
+        optimizer.zero_grad(set_to_none=True)
     step = 0
     epoch = 0
+    training_mode = "audio"
+    mode_counts = {"audio": 0, "text": 0}
     timing_totals = {"data": 0.0, "mimi": 0.0, "train": 0.0, "step": 0.0}
     timing_steps = 0
     previous_step_end = time.perf_counter()
@@ -682,25 +740,41 @@ def run_training() -> None:
             step_start = time.perf_counter()
             data_seconds = step_start - previous_step_end
             mimi_start = time.perf_counter()
+            if step % args.grad_accum == 0:
+                choose_text = (
+                    args.task == "mono_post_training"
+                    and torch.rand((), device=device) < args.text_only_fraction
+                )
+                if world_size > 1:
+                    choice = torch.tensor(int(choose_text), device=device)
+                    dist.broadcast(choice, src=0)
+                    choose_text = bool(choice.item())
+                training_mode = "text" if choose_text else "audio"
+            optimizer = optimizers[training_mode]
+            text_targets = None
             if args.smoke_test:
                 streams = batch["streams"].to(device, non_blocking=True).clone()
-                acoustic_mask = acoustic_prompt_mask(
-                    streams.shape[0], args.text_only_fraction, device=device
-                )
-                streams[~acoustic_mask, 1:] = -1
+                if training_mode == "text":
+                    streams[:, 1:] = -1
+                else:
+                    streams, text_targets = mask_audio_batch_text(
+                        streams,
+                        padding_id=config.text_padding_id,
+                        epad_id=config.text_epad_id,
+                        probability=args.audio_text_mask_probability,
+                    )
             else:
                 assert mimi is not None
-                # Keep a fixed ratio with random positions inside each batch:
-                # by default, batch size 4 means 2 audio-conditioned and 2
-                # text-only examples. Text-only examples retain their text
-                # targets but have no user-audio prompt or audio loss targets.
-                batch_count = batch["waveforms"].shape[0]  # type: ignore[union-attr]
-                acoustic_mask = acoustic_prompt_mask(
-                    batch_count, args.text_only_fraction, device=device
-                )
-                streams = online_streams(
-                    batch, mimi, device, config, acoustic_mask
-                )
+                if training_mode == "text":
+                    streams = text_only_streams(batch, device, config)
+                else:
+                    streams = online_streams(batch, mimi, device, config)
+                    streams, text_targets = mask_audio_batch_text(
+                        streams,
+                        padding_id=config.text_padding_id,
+                        epad_id=config.text_epad_id,
+                        probability=args.audio_text_mask_probability,
+                    )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             mimi_encode_seconds = time.perf_counter() - mimi_start if not args.smoke_test else 0.0
@@ -715,7 +789,9 @@ def run_training() -> None:
             sync_context = objective.no_sync() if world_size > 1 and not sync else contextlib.nullcontext()
             with sync_context:
                 with autocast:
-                    loss, metrics = objective(streams)
+                    loss, metrics = objective(
+                        streams, text_targets, training_mode == "audio"
+                    )
                     scaled_loss = loss / accumulation_size
                 scaled_loss.backward()
 
@@ -727,6 +803,7 @@ def run_training() -> None:
                 torch.cuda.synchronize(device)
             train_seconds = time.perf_counter() - train_start
             step += 1
+            mode_counts[training_mode] += 1
             step_seconds = time.perf_counter() - step_start
             timing_steps += 1
             timing_totals["data"] += data_seconds
@@ -743,6 +820,7 @@ def run_training() -> None:
                     writer.add_scalar(name, value.item(), step)
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
+                writer.add_scalar("training/is_text_only", float(training_mode == "text"), step)
                 writer.add_scalar("timing/data_seconds", data_seconds, step)
                 writer.add_scalar("timing/mimi_seconds", mimi_encode_seconds, step)
                 writer.add_scalar("timing/train_seconds", train_seconds, step)
@@ -757,7 +835,7 @@ def run_training() -> None:
                     if f"assistant_rq_accuracy_{rq}" in metrics
                 )
                 print(
-                    f"step={step} loss={metrics['loss/total'].item():.4f} "
+                    f"step={step} mode={training_mode} loss={metrics['loss/total'].item():.4f} "
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
                     f"{audio_log}"
                     f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
@@ -776,7 +854,7 @@ def run_training() -> None:
                         flush=True,
                     )
             if primary and not args.smoke_test and step % args.save_every == 0:
-                save_checkpoint(model, optimizer, step, Path(args.output))
+                save_checkpoint(model, optimizers, step, Path(args.output))
             validate = valid_loader is not None and step % args.valid_every == 0
             if validate:
                 barrier()
@@ -818,7 +896,7 @@ def run_training() -> None:
 
     barrier()
     if primary and not args.smoke_test:
-        save_checkpoint(model, optimizer, step, Path(args.output))
+        save_checkpoint(model, optimizers, step, Path(args.output))
     if args.smoke_test and world_size > 1:
         for parameter in model.parameters():
             reference = parameter.detach().clone()

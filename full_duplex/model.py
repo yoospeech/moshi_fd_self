@@ -266,9 +266,11 @@ def masked_multistream_loss(
     audio_loss_weight: float = 1.0,
     text_loss_weight: float = 1.0,
     semantic_loss_weight: float = 100.0,
+    text_targets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute assistant text and feedback-audio CE losses."""
-    text_targets = streams[:, :1]
+    if text_targets is None:
+        text_targets = streams[:, :1]
     channel_losses = []
     metrics: dict[str, torch.Tensor] = {}
     for channel, name in enumerate(("assistant",)):

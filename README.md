@@ -15,16 +15,33 @@ Run commands from the repository root with the intended Python environment activ
 ```bash
 git clone --recurse-submodules https://github.com/yoospeech/moshi_fd_self.git
 cd moshi_fd_self
+# CUDA 13.0: install matching PyTorch and TorchAudio builds together.
+python -m pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu130
 python -m pip install -r requirements.txt
 python -m pip install --no-deps -e thirdparty/moshi/moshi
+python -c "import torch, torchaudio; print(torch.__version__, torchaudio.__version__, torch.version.cuda)"
 ```
 
-The verified environment uses Python 3.11, transformers 4.57.6,
-huggingface-hub 0.36.2, moshi 0.2.13 and whisper-timestamped 1.15.9.
-The local interpreter used for verification is
-`/data/util/anaconda3/envs/duplexomni/bin/python`.
-Moshi 0.2.13 requires Hub below 1.0; transformers 5.x is incompatible with
-that requirement. Prefer an isolated environment for this project.
+LFM3 config loading has been checked with Python 3.12.14, transformers 5.22.1
+and huggingface-hub 2.4.0. LFM3 requires newer Transformers APIs; the previous
+Transformers 4.x setup is not sufficient. Install the vendored Moshi with
+`--no-deps` as above because its legacy dependency metadata requires Hub below
+1.0. Prefer an isolated environment for this project.
+
+TorchAudio must match both the PyTorch release and its binary build. The
+requirements pin both to 2.9.0; the CUDA command above selects their build source
+([official installation commands](https://pytorch.org/get-started/previous-versions/)).
+For an existing environment with `_torchaudio.so: undefined symbol`, reinstall
+the pair from that same source rather than relying on already installed wheels:
+
+```bash
+python -m pip install --force-reinstall --no-cache-dir torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu130
+python -c "import torch, torchaudio; print(torch.__version__, torchaudio.__version__, torch.version.cuda)"
+```
+
+Use a matching CPU or other CUDA index for other hardware. Vendor-specific
+PyTorch builds need a matching vendor TorchAudio build (or a source build against
+that PyTorch); matching version numbers alone does not guarantee binary compatibility.
 
 ## Repository layout
 

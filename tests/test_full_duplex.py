@@ -17,7 +17,10 @@ from full_duplex.model import (
 from full_duplex.inference import (
     generate_assistant_text, generate_assistant, load_config,
 )
-from full_duplex.train import mask_audio_batch_text, resolve_model_source, text_only_streams
+from full_duplex.train import (
+    acoustic_prompt_mask, mask_audio_batch_text, mix_text_only_samples,
+    resolve_model_source, text_only_streams,
+)
 from moshi.models.lm_utils import _delay_sequence
 
 
@@ -66,13 +69,30 @@ class AlignmentTests(unittest.TestCase):
             self.assertIn(7, item["assistant_text_tokens"].tolist())
 
     def test_audio_text_mask_preserves_epad_and_original_targets(self):
-        streams = torch.full((1, 9, 5), -1, dtype=torch.long)
-        streams[0, 0] = torch.tensor([10, 11, 3, 4, 10])
+        streams = torch.full((2, 9, 5), -1, dtype=torch.long)
+        streams[:, 0] = torch.tensor([10, 11, 3, 4, 10])
         masked, targets = mask_audio_batch_text(
-            streams, padding_id=10, epad_id=11, probability=1.0
+            streams, padding_id=10, epad_id=11, probability=1.0,
+            acoustic_mask=torch.tensor([True, False]),
         )
         self.assertEqual(masked[0, 0].tolist(), [10, 11, 10, 10, 10])
         self.assertEqual(targets[0, 0].tolist(), [10, 11, 3, 4, 10])
+        self.assertEqual(masked[1, 0].tolist(), [10, 11, 3, 4, 10])
+
+    def test_mixed_batch_contains_audio_and_dense_text_rows(self):
+        mask = acoustic_prompt_mask(4, 0.5, device="cpu")
+        self.assertEqual(mask.sum().item(), 2)
+        streams = torch.full((4, 9, 3), -1, dtype=torch.long)
+        streams[:, 0] = 7
+        streams[mask, 1:5] = 2
+        batch = {"text_only_tokens": torch.tensor([
+            [1, 2, 3, 4], [5, 6, -1, -1], [7, 8, 9, -1], [3, 2, 1, -1]
+        ])}
+        mixed = mix_text_only_samples(streams, batch, mask)
+        self.assertEqual(mixed.shape[-1], 4)
+        self.assertTrue((mixed[~mask, 1:] == -1).all())
+        self.assertTrue((mixed[mask, 1:5, :3] == 2).all())
+        self.assertTrue(torch.equal(mixed[~mask, 0], batch["text_only_tokens"][~mask]))
 
     def test_text_only_stream_uses_entire_batch_and_no_audio(self):
         batch = {"text_only_tokens": torch.tensor([[1, 2, -1], [3, 4, 5]])}

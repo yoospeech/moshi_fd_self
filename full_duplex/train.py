@@ -364,16 +364,46 @@ def mask_audio_batch_text(
     padding_id: int,
     epad_id: int,
     probability: float,
+    acoustic_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask lexical text inputs while preserving EPAD timing and LM targets."""
+    """Mask lexical text inputs only for audio-conditioned batch members."""
     targets = streams[:, :1].clone()
     if probability == 0:
         return streams, targets
     candidates = (targets != -1) & (targets != padding_id) & (targets != epad_id)
+    if acoustic_mask is not None:
+        acoustic_mask = acoustic_mask.to(device=streams.device, dtype=torch.bool)
+        if acoustic_mask.shape != (streams.shape[0],):
+            raise ValueError("acoustic_mask must have one boolean value per sample")
+        candidates &= acoustic_mask[:, None, None]
     selected = candidates & (torch.rand(targets.shape, device=streams.device) < probability)
     masked = streams.clone()
     masked[:, :1][selected] = padding_id
     return masked, targets
+
+
+def mix_text_only_samples(
+    streams: torch.Tensor,
+    batch: dict[str, object],
+    acoustic_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Replace selected rows with dense text-only streams in the same batch."""
+    dense = batch["text_only_tokens"].to(  # type: ignore[union-attr]
+        streams.device, non_blocking=True
+    )
+    acoustic_mask = acoustic_mask.to(device=streams.device, dtype=torch.bool)
+    if acoustic_mask.shape != (streams.shape[0],):
+        raise ValueError("acoustic_mask must have one boolean value per sample")
+    frames = max(streams.shape[-1], dense.shape[-1])
+    if frames != streams.shape[-1]:
+        expanded = streams.new_full((streams.shape[0], streams.shape[1], frames), -1)
+        expanded[:, :, : streams.shape[-1]] = streams
+        streams = expanded
+    mixed = streams.clone()
+    text_only = ~acoustic_mask
+    mixed[text_only] = -1
+    mixed[text_only, 0, : dense.shape[-1]] = dense[text_only]
+    return mixed
 
 
 @torch.no_grad()
@@ -577,10 +607,8 @@ def run_training() -> None:
             weight_decay=0.1,
         )
 
-    optimizers = {
-        "audio": make_optimizer(),
-        "text": make_optimizer(),
-    }
+    optimizers = {"mixed": make_optimizer()}
+    optimizer = optimizers["mixed"]
 
     if args.smoke_test:
         # Valid DSM controls plus random Mimi codes. This checks the complete
@@ -724,12 +752,9 @@ def run_training() -> None:
         batches = loader
         target_steps = args.steps
 
-    for optimizer in optimizers.values():
-        optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)
     step = 0
     epoch = 0
-    training_mode = "audio"
-    mode_counts = {"audio": 0, "text": 0}
     timing_totals = {"data": 0.0, "mimi": 0.0, "train": 0.0, "step": 0.0}
     timing_steps = 0
     previous_step_end = time.perf_counter()
@@ -740,41 +765,30 @@ def run_training() -> None:
             step_start = time.perf_counter()
             data_seconds = step_start - previous_step_end
             mimi_start = time.perf_counter()
-            if step % args.grad_accum == 0:
-                choose_text = (
-                    args.task == "mono_post_training"
-                    and torch.rand((), device=device) < args.text_only_fraction
-                )
-                if world_size > 1:
-                    choice = torch.tensor(int(choose_text), device=device)
-                    dist.broadcast(choice, src=0)
-                    choose_text = bool(choice.item())
-                training_mode = "text" if choose_text else "audio"
-            optimizer = optimizers[training_mode]
-            text_targets = None
+            batch_size = (
+                batch["streams"].shape[0]
+                if args.smoke_test else batch["assistant_text_tokens"].shape[0]
+            )
+            acoustic_mask = (
+                acoustic_prompt_mask(batch_size, args.text_only_fraction, device=device)
+                if args.task == "mono_post_training" else
+                torch.ones(batch_size, dtype=torch.bool, device=device)
+            )
             if args.smoke_test:
                 streams = batch["streams"].to(device, non_blocking=True).clone()
-                if training_mode == "text":
-                    streams[:, 1:] = -1
-                else:
-                    streams, text_targets = mask_audio_batch_text(
-                        streams,
-                        padding_id=config.text_padding_id,
-                        epad_id=config.text_epad_id,
-                        probability=args.audio_text_mask_probability,
-                    )
+                streams[~acoustic_mask, 1:] = -1
             else:
                 assert mimi is not None
-                if training_mode == "text":
-                    streams = text_only_streams(batch, device, config)
-                else:
-                    streams = online_streams(batch, mimi, device, config)
-                    streams, text_targets = mask_audio_batch_text(
-                        streams,
-                        padding_id=config.text_padding_id,
-                        epad_id=config.text_epad_id,
-                        probability=args.audio_text_mask_probability,
-                    )
+                streams = online_streams(batch, mimi, device, config, acoustic_mask)
+                if args.task == "mono_post_training":
+                    streams = mix_text_only_samples(streams, batch, acoustic_mask)
+            streams, text_targets = mask_audio_batch_text(
+                streams,
+                padding_id=config.text_padding_id,
+                epad_id=config.text_epad_id,
+                probability=args.audio_text_mask_probability,
+                acoustic_mask=acoustic_mask,
+            )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             mimi_encode_seconds = time.perf_counter() - mimi_start if not args.smoke_test else 0.0
@@ -789,9 +803,7 @@ def run_training() -> None:
             sync_context = objective.no_sync() if world_size > 1 and not sync else contextlib.nullcontext()
             with sync_context:
                 with autocast:
-                    loss, metrics = objective(
-                        streams, text_targets, training_mode == "audio"
-                    )
+                    loss, metrics = objective(streams, text_targets, True)
                     scaled_loss = loss / accumulation_size
                 scaled_loss.backward()
 
@@ -803,7 +815,6 @@ def run_training() -> None:
                 torch.cuda.synchronize(device)
             train_seconds = time.perf_counter() - train_start
             step += 1
-            mode_counts[training_mode] += 1
             step_seconds = time.perf_counter() - step_start
             timing_steps += 1
             timing_totals["data"] += data_seconds
@@ -820,7 +831,7 @@ def run_training() -> None:
                     writer.add_scalar(name, value.item(), step)
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
-                writer.add_scalar("training/is_text_only", float(training_mode == "text"), step)
+                writer.add_scalar("training/audio_fraction", acoustic_mask.float().mean().item(), step)
                 writer.add_scalar("timing/data_seconds", data_seconds, step)
                 writer.add_scalar("timing/mimi_seconds", mimi_encode_seconds, step)
                 writer.add_scalar("timing/train_seconds", train_seconds, step)
@@ -835,7 +846,8 @@ def run_training() -> None:
                     if f"assistant_rq_accuracy_{rq}" in metrics
                 )
                 print(
-                    f"step={step} mode={training_mode} loss={metrics['loss/total'].item():.4f} "
+                    f"step={step} mode=mixed audio_samples={int(acoustic_mask.sum())} "
+                    f"text_samples={int((~acoustic_mask).sum())} loss={metrics['loss/total'].item():.4f} "
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
                     f"{audio_log}"
                     f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "

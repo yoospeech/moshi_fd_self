@@ -114,9 +114,7 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
         assistant_channel: int = 0,
         min_duration: float = 5.0,
         max_duration: float = 45.0,
-        min_words: int = 5,
-        min_words_per_second: float = 0.5,
-        max_words_per_second: float = 2.5,
+        min_text_tokens: int = 5,
         min_speech_coverage: float = 0.05,
         max_speech_coverage: float = 0.8,
     ) -> None:
@@ -129,14 +127,16 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
         self.text_epad_id = text_epad_id
         self.user_channel = user_channel
         self.assistant_channel = assistant_channel
+        if min_text_tokens < 0:
+            raise ValueError("min_text_tokens must be non-negative")
+        self.min_text_tokens = min_text_tokens
         with self.manifest.open(encoding="utf-8") as handle:
             raw_entries = [json.loads(line) for line in handle if line.strip()]
         self.original_size = len(raw_entries)
         self.entries = []
         self.rejected: dict[str, int] = {
             "duration": 0,
-            "words": 0,
-            "words_per_second": 0,
+            "text_tokens": 0,
             "alignment": 0,
             "speech_coverage": 0,
             "text_collision": 0,
@@ -154,13 +154,9 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
             # schema stores its timestamped words under ``alignments``.
             sidecar = json.loads(audio_path.with_suffix(".json").read_text(encoding="utf-8"))
             inner_monologue_alignments = sidecar["alignments"]
-            word_count = len(inner_monologue_alignments)
-            if word_count < min_words:
-                self.rejected["words"] += 1
-                continue
-            words_per_second = word_count / duration
-            if not min_words_per_second <= words_per_second <= max_words_per_second:
-                self.rejected["words_per_second"] += 1
+            text_token_count = self._lexical_token_count(inner_monologue_alignments)
+            if text_token_count < self.min_text_tokens:
+                self.rejected["text_tokens"] += 1
                 continue
             intervals = []
             invalid = False
@@ -209,6 +205,9 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
     def _word_tokens(self, word: str) -> list[int]:
         # Preserve SmolLM2's word-boundary BPE form for every aligned word.
         return self.tokenizer.encode(" " + word, add_special_tokens=False)
+
+    def _lexical_token_count(self, alignments: list[Any]) -> int:
+        return sum(len(self._word_tokens(str(word))) for word, _, _ in alignments)
 
     def _aligned_text_stream(
         self, alignments: list[Any], frame_length: int
@@ -338,9 +337,7 @@ class MonoContinuationDataset(StereoDialogueDataset):
         text_epad_id: int,
         min_duration: float = 2.0,
         max_duration: float = 45.0,
-        min_words: int = 0,
-        min_words_per_second: float = 0.0,
-        max_words_per_second: float = float("inf"),
+        min_text_tokens: int = 0,
         min_prefix_seconds: float = 1.0,
         min_suffix_seconds: float = 1.0,
         gap_seconds: tuple[float, float] = (0.1, 0.5),
@@ -354,10 +351,11 @@ class MonoContinuationDataset(StereoDialogueDataset):
     ) -> None:
         if min_prefix_seconds <= 0 or min_suffix_seconds <= 0:
             raise ValueError("continuation prefix and suffix durations must be positive")
-        if min_words < 0:
-            raise ValueError("min_words must be non-negative")
-        if min_words_per_second < 0 or max_words_per_second < min_words_per_second:
-            raise ValueError("invalid words-per-second range")
+        if min_text_tokens < 0:
+            raise ValueError("min_text_tokens must be non-negative")
+        if min_text_tokens and tokenizer is None:
+            raise ValueError("min_text_tokens requires a tokenizer")
+        self.min_text_tokens = min_text_tokens
         if gap_seconds[0] < 0 or gap_seconds[1] < gap_seconds[0]:
             raise ValueError("invalid continuation gap range")
         if sum(value is not None for value in (manifest, entries, folders)) != 1:
@@ -374,9 +372,6 @@ class MonoContinuationDataset(StereoDialogueDataset):
         self.alignment_device = alignment_device
         self.min_prefix_seconds = min_prefix_seconds
         self.min_suffix_seconds = min_suffix_seconds
-        self.min_words = min_words
-        self.min_words_per_second = min_words_per_second
-        self.max_words_per_second = max_words_per_second
         self.gap_seconds = gap_seconds
         self.seed = seed
         self._alignment_model: Any | None = None
@@ -384,8 +379,7 @@ class MonoContinuationDataset(StereoDialogueDataset):
         self.entries: list[dict[str, Any]] = []
         self.rejected = {
             "duration": 0,
-            "words": 0,
-            "words_per_second": 0,
+            "text_tokens": 0,
             "split": 0,
             "alignment": 0,
             "text_collision": 0,
@@ -453,18 +447,15 @@ class MonoContinuationDataset(StereoDialogueDataset):
                 for word, times, speaker in alignments
                 if float(times[0]) >= split
             ]
-            rejection = self._suffix_rejection(
-                suffix_alignments, duration=duration, split=split, gap=gap
-            )
-            if rejection is not None:
-                self.rejected[rejection] += 1
-                continue
             try:
                 # Audio-only exporters pass None; training always supplies its tokenizer.
+                self._check_suffix_tokens(suffix_alignments, str(entry["path"]))
                 if self.tokenizer is not None:
                     self._aligned_text_stream(
                         suffix_alignments, max(1, math.ceil((duration + gap) * self.frame_rate))
                     )
+            except RecoverableSampleError:
+                continue
             except TextAlignmentCollision:
                 self.rejected["text_collision"] += 1
                 continue
@@ -546,17 +537,7 @@ class MonoContinuationDataset(StereoDialogueDataset):
             for word, times, speaker in alignments
             if float(times[0]) >= split
         ]
-        rejection = self._suffix_rejection(
-            suffix_alignments,
-            duration=float(entry["duration"]),
-            split=split,
-            gap=gap,
-        )
-        if rejection is not None:
-            self.rejected[rejection] += 1
-            raise RecoverableSampleError(
-                f"{entry['path']}: continuation suffix rejected by {rejection} filter"
-            )
+        self._check_suffix_tokens(suffix_alignments, str(entry["path"]))
         if self.tokenizer is not None:
             try:
                 self._aligned_text_stream(
@@ -571,26 +552,18 @@ class MonoContinuationDataset(StereoDialogueDataset):
         )
         return entry
 
-    def _suffix_rejection(
-        self,
-        suffix_alignments: list[Any],
-        *,
-        duration: float,
-        split: float,
-        gap: float,
-    ) -> str | None:
-        """Apply text-density filters to the assistant continuation target."""
-        word_count = len(suffix_alignments)
-        if word_count < self.min_words:
-            return "words"
-        # The assistant target occupies the inserted gap plus the remaining
-        # source duration, so use that complete target window for WPS just as
-        # StereoDialogueDataset uses the complete stereo sample duration.
-        suffix_duration = duration - split + gap
-        words_per_second = word_count / suffix_duration
-        if not self.min_words_per_second <= words_per_second <= self.max_words_per_second:
-            return "words_per_second"
-        return None
+    def _check_suffix_tokens(self, alignments: list[Any], path: str) -> None:
+        if not self.min_text_tokens:
+            return
+        # Match the word-by-word encoding used by _aligned_text_stream;
+        # inserted PAD/EPAD tokens do not count as lexical targets.
+        count = self._lexical_token_count(alignments)
+        if count < self.min_text_tokens:
+            self.rejected["text_tokens"] += 1
+            raise RecoverableSampleError(
+                f"{path}: continuation suffix rejected by text_tokens filter "
+                f"(text_tokens={count}, min_text_tokens={self.min_text_tokens})"
+            )
 
     def _load_alignments(self, entry: dict[str, Any]) -> list[Any] | None:
         if "alignments" in entry:

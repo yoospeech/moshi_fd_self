@@ -191,9 +191,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-batches", type=int, default=20)
     parser.add_argument("--min-duration", type=float, default=5.0)
     parser.add_argument("--max-duration", type=float, default=200.0)
-    parser.add_argument("--min-words", type=int, default=5)
-    parser.add_argument("--min-words-per-second", type=float, default=0.5)
-    parser.add_argument("--max-words-per-second", type=float, default=2.5)
+    parser.add_argument("--min-text-tokens", type=int, default=5,
+                        help="minimum lexical tokenizer pieces in an assistant target; 0 disables")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=4)
@@ -560,10 +559,8 @@ def run_training() -> None:
                 sample_rate=24000, frame_rate=config.frame_rate,
                 text_padding_id=config.text_padding_id, text_epad_id=config.text_epad_id,
                 min_duration=args.min_duration, max_duration=args.max_duration,
-                min_words=args.min_words,
-                min_words_per_second=args.min_words_per_second,
-                max_words_per_second=args.max_words_per_second,
                 min_prefix_seconds=args.continuation_min_prefix_seconds,
+                min_text_tokens=args.min_text_tokens,
                 min_suffix_seconds=args.continuation_min_suffix_seconds,
                 gap_seconds=(args.continuation_min_gap_seconds, args.continuation_max_gap_seconds),
                 seed=args.seed,
@@ -597,9 +594,7 @@ def run_training() -> None:
                 text_epad_id=config.text_epad_id,
                 min_duration=args.min_duration,
                 max_duration=args.max_duration,
-                min_words=args.min_words,
-                min_words_per_second=args.min_words_per_second,
-                max_words_per_second=args.max_words_per_second,
+                min_text_tokens=args.min_text_tokens,
             )
         print(
             f"dataset filter: original={dataset.original_size} kept={len(dataset)} "

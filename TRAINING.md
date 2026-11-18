@@ -24,11 +24,14 @@ while retaining assistant text targets. Use `0` for fully acoustic batches.
 
 ## Mono continuation post-training
 
-Duration limits apply to the original mono recording. `--min-words` and the
-words-per-second limits apply to the assistant suffix after splitting; its
-density is measured over the remaining audio duration plus the inserted gap.
-These filters also run after online alignment. Rejected lazy samples are replaced
-by the next valid sample; strict limits can exhaust a small dataset.
+Duration limits apply to the recording. Mono continuation and stereo fine-tuning
+both use `--min-text-tokens` (default 5), requiring at least that many lexical
+tokenizer pieces in the assistant target (the suffix for mono),
+using the same word-by-word encoding as the text targets, excluding PAD/EPAD.
+Set it to 0 to disable the token minimum. Valid word boundaries and actual BPE
+frame collision checks are still required,
+including after online alignment. Rejected lazy samples are replaced by the next
+valid sample.
 
 `MonoContinuationDataset` turns one mono utterance into a synthetic turn:
 
@@ -58,8 +61,7 @@ PYTHONPATH=. \
   --text-padding-weight 0.5 --text-only-fraction 0.5 \
   --batch-size 4 --grad-accum 1 --steps 100000 \
   --learning-rate 2e-4 --temporal-learning-rate 2e-5 \
-  --min-duration 5 --max-duration 100 --min-words 5 \
-  --min-words-per-second 0.5 --max-words-per-second 2.5 \
+  --min-duration 5 --max-duration 100 --min-text-tokens 5 \
   --valid-ratio 0.05 --valid-every 500 --valid-batches 54 \
   --log-every 10 --save-every 500 --print-model \
   --output runs/LFM3-1.7B_mono_post_training

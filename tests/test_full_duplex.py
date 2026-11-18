@@ -22,6 +22,25 @@ from moshi.models.lm_utils import _delay_sequence
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_stereo_minimum_bpe_tokens(self):
+        class Tokenizer:
+            def encode(self, text, **kwargs):
+                return [2]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "0.json").write_text(json.dumps({"alignments": [
+                ["assistant", [.8, 1.0], "SPEAKER_MAIN"]
+            ]}))
+            manifest = root / "manifest.jsonl"
+            manifest.write_text(json.dumps({"path": "0.wav", "duration": 2}) + "\n")
+            with self.assertRaisesRegex(ValueError, "empty manifest"):
+                StereoDialogueDataset(
+                    manifest, Tokenizer(), text_padding_id=10, text_epad_id=11,
+                    min_duration=0, min_text_tokens=2,
+                    min_speech_coverage=0, max_speech_coverage=1,
+                )
+
     def test_mono_continuation_keeps_prefix_and_suffix_on_separate_streams(self):
         class Tokenizer:
             def encode(self, text, **kwargs):
@@ -66,7 +85,7 @@ class AlignmentTests(unittest.TestCase):
             }) + "\n")
             ds = StereoDialogueDataset(
                 manifest, Tokenizer(), text_padding_id=10, text_epad_id=11,
-                min_duration=0, min_words=1, min_words_per_second=0,
+                min_duration=0, min_text_tokens=1,
                 min_speech_coverage=0, max_speech_coverage=1,
             )
             audio = torch.stack([torch.ones(48000), torch.zeros(48000)]).numpy()

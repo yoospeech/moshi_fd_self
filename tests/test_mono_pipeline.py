@@ -91,64 +91,35 @@ class MonoPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MonoContinuationDataset._validate_alignments([['word', [0, float('nan')], 'S']], 4)
 
-    def test_suffix_text_filters_apply_to_mono_target(self):
-        entries = [{
-            'path': 'short-target.wav',
-            'duration': 6,
-            'alignments': [
-                ['prefix', [0, 2], 'S'],
-                ['only', [2, 3], 'S'],
-                ['two', [3, 4], 'S'],
-            ],
-        }]
-        with patch.object(MonoContinuationDataset, '_split_time', return_value=2):
-            with self.assertRaisesRegex(ValueError, 'empty mono continuation dataset'):
-                MonoContinuationDataset(
-                    None,
-                    Tokenizer(),
-                    entries=entries,
-                    text_padding_id=10,
-                    text_epad_id=11,
-                    min_words=3,
-                    min_words_per_second=0.5,
-                    max_words_per_second=2.5,
-                    gap_seconds=(0, 0),
-                )
-
-    def test_suffix_density_boundaries_and_lazy_filtering(self):
-        words = [['prefix', [0, 2], 'S'], ['one', [2, 2.2], 'S'],
-                 ['two', [2.5, 2.7], 'S']]
-        cases = [
-            (6, 2, 0.5, 2.5, None),  # Exactly the minimum density.
-            (6, 3, 0.5, 2.5, 'words'),
-            (7, 2, 0.5, 2.5, 'words_per_second'),
-            (4, 2, 0.0, 0.9, 'words_per_second'),
-            (4, 2, 0.0, 1.0, None),  # Exactly the maximum density.
-        ]
-        for duration, minimum, low, high, rejection in cases:
-            for lazy in (False, True):
-                with self.subTest(duration=duration, minimum=minimum, lazy=lazy):
-                    entry = {'path': 'sample.wav', 'duration': duration,
-                             'language': 'en', 'alignments': None if lazy else words}
+    def test_minimum_suffix_bpe_tokens_eager_and_online(self):
+        for lazy in (False, True):
+            for count in (4, 5):
+                with self.subTest(lazy=lazy, tokens=count):
+                    words = [['prefix', [0, 2], 'S'], ['suffix', [2, 4], 'S']]
+                    tokenizer = Mock()
+                    tokenizer.encode.return_value = list(range(20, 20 + count))
+                    entry = {'path': 'sample.wav', 'duration': 4, 'language': 'en',
+                             'alignments': None if lazy else words}
                     kwargs = dict(text_padding_id=10, text_epad_id=11,
-                                  min_words=minimum, min_words_per_second=low,
-                                  max_words_per_second=high, gap_seconds=(0, 0))
+                                  min_text_tokens=5, gap_seconds=(0, 0))
                     with patch('full_duplex.dataset.discover_mono_continuation_entries',
                                return_value=([entry], {})), patch.object(
                                    MonoContinuationDataset, '_split_time', return_value=2):
                         if lazy:
-                            ds = MonoContinuationDataset(None, Tokenizer(), folders='unused:en',
+                            ds = MonoContinuationDataset(None, tokenizer, folders='unused:en',
                                                          online_alignment=True, **kwargs)
                             with patch.object(ds, '_extract_alignment', return_value=words):
-                                if rejection:
-                                    with self.assertRaisesRegex(RecoverableSampleError, rejection):
+                                if count < 5:
+                                    with self.assertRaisesRegex(RecoverableSampleError,
+                                                               'text_tokens=4, min_text_tokens=5'):
                                         ds._prepare_lazy_entry(0)
-                                    self.assertEqual(ds.rejected[rejection], 1)
+                                    self.assertEqual(ds.rejected['text_tokens'], 1)
                                 else:
-                                    self.assertEqual(ds._prepare_lazy_entry(0)['split_seconds'], 2)
-                        elif rejection:
+                                    ds._prepare_lazy_entry(0)
+                        elif count < 5:
                             with self.assertRaisesRegex(ValueError, 'empty mono continuation dataset'):
-                                MonoContinuationDataset(None, Tokenizer(), entries=[entry], **kwargs)
+                                MonoContinuationDataset(None, tokenizer, entries=[entry], **kwargs)
                         else:
-                            ds = MonoContinuationDataset(None, Tokenizer(), entries=[entry], **kwargs)
+                            ds = MonoContinuationDataset(None, tokenizer, entries=[entry], **kwargs)
                             self.assertEqual(len(ds), 1)
+                        tokenizer.encode.assert_any_call(' suffix', add_special_tokens=False)

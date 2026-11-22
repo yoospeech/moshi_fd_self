@@ -229,7 +229,7 @@ def main(args: argparse.Namespace) -> None:
             f"--shard-index must be in [0, {args.num_shards}), got {args.shard_index}"
         )
     device = resolve_device(args.device, args.gpu)
-    audio_paths = sorted(args.input_dir.glob("*.wav"))
+    audio_paths = sorted(args.input_dir.rglob("*.wav"))
     total_files = len(audio_paths)
     audio_paths = audio_paths[args.shard_index::args.num_shards]
     if args.limit is not None:
@@ -237,8 +237,8 @@ def main(args: argparse.Namespace) -> None:
     if not audio_paths:
         raise FileNotFoundError(f"No WAV files found in {args.input_dir}")
 
-    output_dir = args.output_dir or args.input_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
     print(
         f"Loading Whisper {args.model!r} on {device}; shard={args.shard_index}/{args.num_shards}; "
         f"files={len(audio_paths)}/{total_files}"
@@ -247,8 +247,13 @@ def main(args: argparse.Namespace) -> None:
 
     completed = skipped = failed = 0
     for index, audio_path in enumerate(audio_paths, 1):
-        output_path = output_dir / f"{audio_path.stem}.alignment.json"
-        error_path = output_dir / f"{audio_path.stem}.alignment.json.err"
+        if args.output_dir is None:
+            output_parent = audio_path.parent
+        else:
+            output_parent = args.output_dir / audio_path.relative_to(args.input_dir).parent
+            output_parent.mkdir(parents=True, exist_ok=True)
+        output_path = output_parent / f"{audio_path.stem}.alignment.json"
+        error_path = output_parent / f"{audio_path.stem}.alignment.json.err"
         if output_path.exists() and not args.overwrite:
             skipped += 1
             continue

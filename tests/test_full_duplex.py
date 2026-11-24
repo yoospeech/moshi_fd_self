@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from transformers import LlamaConfig, LlamaModel
 
-from full_duplex.dataset import StereoDialogueDataset, MonoContinuationDataset, TextAlignmentCollision
+from full_duplex.dataset import StereoDialogueDataset, MonoPostTrainingDataset, TextAlignmentCollision
 from full_duplex.model import (
     FullDuplexConfig, MoshiFullDuplexModel, masked_multistream_loss,
 )
@@ -55,10 +55,9 @@ class AlignmentTests(unittest.TestCase):
                 "path": "0.wav", "duration": 4,
                 "alignments": [["hello", [0, 2], "S"], ["world", [2, 4], "S"]],
             }) + "\n")
-            dataset = MonoContinuationDataset(
+            dataset = MonoPostTrainingDataset(
                 root / "manifest.jsonl", Tokenizer(), text_padding_id=10, text_epad_id=11,
-                min_duration=0, min_prefix_seconds=1, min_suffix_seconds=1,
-                gap_seconds=(0.5, 0.5), seed=1,
+                min_duration=0,
             )
             audio = torch.linspace(-1, 1, 96000, dtype=torch.float32).numpy()
             with patch("full_duplex.dataset.sphn.read", return_value=(audio, 24000)):

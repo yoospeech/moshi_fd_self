@@ -22,22 +22,23 @@ prompt. Assistant audio is predicted through the Depth Transformer.
 `--text-only-fraction` removes acoustic streams from a portion of each batch
 while retaining assistant text targets. Use `0` for fully acoustic batches.
 
-## Mono continuation post-training
+## Mono post-training
 
-Duration limits apply to the recording. Mono continuation and stereo fine-tuning
+Duration limits apply to the recording. Mono post-training and stereo fine-tuning
 both use `--min-text-tokens` (default 5), requiring at least that many lexical
-tokenizer pieces in the assistant target (the suffix for mono),
+tokenizer pieces in the assistant target (the complete utterance for mono),
 using the same word-by-word encoding as the text targets, excluding PAD/EPAD.
 Set it to 0 to disable the token minimum. Valid word boundaries and actual BPE
 frame collision checks are still required,
 including after online alignment. Rejected lazy samples are replaced by the next
 valid sample.
 
-`MonoContinuationDataset` turns one mono utterance into a synthetic turn:
+`MonoPostTrainingDataset` uses the complete mono utterance as assistant audio and
+text, with an absent user-audio stream:
 
 ```text
-word-aligned prefix -> user audio
-word-aligned suffix -> assistant text and audio
+silence -> user audio
+full word-aligned utterance -> assistant text and audio
 ```
 
 Pass comma-separated `folder:Whisper-language-code` inputs. No combined input
@@ -89,6 +90,20 @@ the backbone and Mimi together.
 `StereoDialogueDataset` reads stereo user/assistant audio and assistant word
 alignment sidecars.
 
+The same recursive folder loader used by mono post-training can read native
+stereo WAVs. It expects `<stem>.alignment.json` sidecars, uses assistant channel
+0 and user channel 1, and preserves the complete stereo timeline:
+
+```bash
+PYTHONPATH=. python train_full_duplex.py \
+  --task finetuning \
+  --folders '/path/to/behavior-sd/validation:en' \
+  --alignment-mode sidecar \
+  --model models/SmolLM2-135M \
+  --batch-size 4 --steps 1000 \
+  --output runs/stereo_finetuning
+```
+
 ```bash
 PYTHONPATH=. python train_full_duplex.py \
   --task finetuning \
@@ -114,14 +129,17 @@ Example stereo DDP launch:
 ```bash
 PYTHONPATH=. torchrun --standalone --nproc_per_node=2 train_full_duplex.py \
   --model LFM3-1.7B --task finetuning \
-  --manifest /path/to/stereo_dialogue.jsonl \
+  --folders '/path/to/behavior-sd/validation:en' \
+  --alignment-mode sidecar \
   --batch-size 4 --grad-accum 2 --steps 1000 \
   --output runs/stereo_ddp
 ```
 
-Batch size is per rank. Do not pass `--mimi-device` under DDP. Online mono
-alignment currently repeats on every rank; for multi-GPU mono training, create
-sidecars first and use `--alignment-mode sidecar`.
+Batch size is per rank, so the effective batch above is
+`2 GPUs * 4 samples * 2 accumulation = 16`. Do not pass `--mimi-device` under
+DDP. Online alignment competes with the backbone and Mimi for memory on every
+rank; for multi-GPU training, create sidecars first and use
+`--alignment-mode sidecar`.
 
 ## Losses and metrics
 

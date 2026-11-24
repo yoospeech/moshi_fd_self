@@ -113,7 +113,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alignment-device", default="cpu")
     parser.add_argument(
         "--folders",
-        help="comma-separated folder:language inputs for mono_post_training, e.g. /data/en:en,/data/ko:ko",
+        help=(
+            "comma-separated recursive folder:language inputs for mono post-training "
+            "or stereo fine-tuning, e.g. /data/en:en,/data/ko:ko"
+        ),
     )
     parser.add_argument(
         "--max-files", type=int, default=0,
@@ -123,10 +126,6 @@ def parse_args() -> argparse.Namespace:
         "--task", choices=("mono_post_training", "finetuning"), default="finetuning",
         help="mono_post_training trains full mono utterances as assistant; finetuning reads stereo dialogue",
     )
-    parser.add_argument("--continuation-min-prefix-seconds", type=float, default=1.0)
-    parser.add_argument("--continuation-min-suffix-seconds", type=float, default=1.0)
-    parser.add_argument("--continuation-min-gap-seconds", type=float, default=0.1)
-    parser.add_argument("--continuation-max-gap-seconds", type=float, default=0.5)
     parser.add_argument("--model", default="models/LFM3-1.7B")
     parser.add_argument(
         "--model-download-root",
@@ -646,7 +645,6 @@ def run_training() -> None:
                 text_padding_id=config.text_padding_id, text_epad_id=config.text_epad_id,
                 min_duration=args.min_duration, max_duration=args.max_duration,
                 min_text_tokens=args.min_text_tokens,
-                seed=args.seed,
             )
             if dataset.discovery_stats is not None:
                 print(f"folder discovery: {dataset.discovery_stats}")
@@ -662,23 +660,42 @@ def run_training() -> None:
                 for name, value in dataset.timing_stats.items():
                     writer.add_scalar(f"timing/dataset_{name}", float(value), 0)
         else:
+            if args.folders and args.manifest:
+                raise SystemExit("pass either --folders or --manifest, not both")
             if args.folders:
-                raise SystemExit("--folders is supported only by --task mono_post_training")
-            if args.manifest is None:
-                raise SystemExit(
-                    "fine-tuning requires --manifest unless --smoke-test is used"
+                dataset = MonoPostTrainingDataset(
+                    None,
+                    tokenizer,
+                    folders=args.folders,
+                    max_files=args.max_files,
+                    online_alignment=args.alignment_mode == "online",
+                    whisper_model=args.alignment_model,
+                    alignment_device=args.alignment_device,
+                    audio_mode="stereo",
+                    sample_rate=24000,
+                    frame_rate=config.frame_rate,
+                    text_padding_id=config.text_padding_id,
+                    text_epad_id=config.text_epad_id,
+                    min_duration=args.min_duration,
+                    max_duration=args.max_duration,
+                    min_text_tokens=args.min_text_tokens,
                 )
-            dataset = StereoDialogueDataset(
-                args.manifest,
-                tokenizer,
-                sample_rate=24000,
-                frame_rate=config.frame_rate,
-                text_padding_id=config.text_padding_id,
-                text_epad_id=config.text_epad_id,
-                min_duration=args.min_duration,
-                max_duration=args.max_duration,
-                min_text_tokens=args.min_text_tokens,
-            )
+            elif args.manifest is None:
+                raise SystemExit(
+                    "fine-tuning requires --folders or --manifest unless --smoke-test is used"
+                )
+            else:
+                dataset = StereoDialogueDataset(
+                    args.manifest,
+                    tokenizer,
+                    sample_rate=24000,
+                    frame_rate=config.frame_rate,
+                    text_padding_id=config.text_padding_id,
+                    text_epad_id=config.text_epad_id,
+                    min_duration=args.min_duration,
+                    max_duration=args.max_duration,
+                    min_text_tokens=args.min_text_tokens,
+                )
         print(
             f"dataset filter: original={dataset.original_size} kept={len(dataset)} "
             f"hours={dataset.filtered_hours:.2f} rejected={dataset.rejected}"
@@ -710,7 +727,12 @@ def run_training() -> None:
                 ),
                 encoding="utf-8",
             )
-        if args.task == "mono_post_training" and args.alignment_mode == "online":
+        lazy_folder_alignment = (
+            isinstance(dataset, MonoPostTrainingDataset)
+            and args.alignment_mode == "online"
+            and bool(args.folders)
+        )
+        if lazy_folder_alignment:
             train_dataset = SkipInvalidDataset(train_dataset)
             valid_dataset = SkipInvalidDataset(valid_dataset)
         if world_size > 1:
@@ -728,11 +750,7 @@ def run_training() -> None:
             # Lazy Whisper owns a model (and possibly a CUDA context), so it
             # must run in this rank's training process rather than forked
             # DataLoader workers. Prepared alignments remain cached in memory.
-            num_workers=0 if (
-                args.task == "mono_post_training"
-                and args.alignment_mode == "online"
-                and bool(args.folders)
-            ) else 2,
+            num_workers=0 if lazy_folder_alignment else 2,
             pin_memory=device.type == "cuda",
             collate_fn=collate_duplex,
         )
@@ -740,11 +758,7 @@ def run_training() -> None:
             valid_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=0 if (
-                args.task == "mono_post_training"
-                and args.alignment_mode == "online"
-                and bool(args.folders)
-            ) else 2,
+            num_workers=0 if lazy_folder_alignment else 2,
             pin_memory=device.type == "cuda",
             collate_fn=collate_duplex,
         )

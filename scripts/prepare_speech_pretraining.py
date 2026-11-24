@@ -1,4 +1,4 @@
-"""Folders -> word annotation -> continuation stereo/text -> Mimi tokens.
+"""Folders -> word annotation -> full-utterance stereo/text -> Mimi tokens.
 
 Run with PYTHONPATH=.:thirdparty/moshi/moshi. Existing training is unchanged;
 the exported Mimi tokens are artifacts, not yet a training-cache interface.
@@ -42,7 +42,7 @@ def main():
     import soundfile as sf
     import torch
     from moshi.models import loaders
-    from full_duplex.dataset import MonoContinuationDataset
+    from full_duplex.dataset import MonoPostTrainingDataset
     # Reuse the supplied annotation procedure without changing annotate.py.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import annotate
@@ -104,10 +104,10 @@ def main():
     checkpoint = args.mimi_checkpoint or str(loaders.hf_get(loaders.MIMI_NAME, loaders.DEFAULT_REPO))
     mimi = loaders.get_mimi(checkpoint, device=device, num_codebooks=args.num_codebooks)
     mimi.eval().requires_grad_(False)
-    dataset = MonoContinuationDataset(
+    dataset = MonoPostTrainingDataset(
         None, None, entries=annotated, text_padding_id=0, text_epad_id=1,
         sample_rate=mimi.sample_rate, frame_rate=mimi.frame_rate,
-        min_duration=args.min_duration, max_duration=args.max_duration, seed=args.seed,
+        min_duration=args.min_duration, max_duration=args.max_duration,
     )
     results = []
     for index, entry in enumerate(dataset.entries):
@@ -129,8 +129,7 @@ def main():
                      mimi.sample_rate, subtype='PCM_16')
             text = ' '.join(w.strip() for w, _, _ in alignments)
             write_json(stereo_path.with_suffix('.json'), {'alignments': alignments,
-                       'text': text, 'source_path': entry['path'],
-                       'split_seconds': entry['split_seconds'], 'gap_seconds': entry['gap_seconds']})
+                       'text': text, 'source_path': entry['path']})
             results.append({'path': str(stereo_path), 'duration': user.numel() / mimi.sample_rate,
                             'user_channel': 1, 'assistant_channel': 0,
                             'assistant_text': text, 'mimi_path': str(tokens_path),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import time
@@ -23,15 +22,25 @@ class RecoverableSampleError(ValueError):
     """A lazily prepared sample is unusable and may be skipped."""
 
 
-def discover_mono_continuation_entries(
-    folders: str, *, max_files: int = 0, include_unannotated: bool = False
+def discover_speech_entries(
+    folders: str,
+    *,
+    max_files: int = 0,
+    include_unannotated: bool = False,
+    audio_mode: str = "mono",
+    user_channel: int = 1,
+    assistant_channel: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Discover annotated mono WAVs from comma-separated ``folder:language`` inputs.
+    """Discover WAVs from comma-separated ``folder:language`` inputs.
 
-    Without include_unannotated, only WAVs with JSON sidecars are kept.
+    Mono audio uses ``<stem>.json`` sidecars. Stereo audio uses
+    ``<stem>.alignment.json`` so source metadata can remain at ``<stem>.json``.
+    Without include_unannotated, only WAVs with alignment sidecars are kept.
     """
     import soundfile as sf
 
+    if audio_mode not in {"mono", "stereo"}:
+        raise ValueError(f"unsupported audio mode: {audio_mode!r}")
     if max_files < 0:
         raise ValueError("max_files must be non-negative")
     parts = folders.split(",")
@@ -68,14 +77,17 @@ def discover_mono_continuation_entries(
     entries: list[dict[str, Any]] = []
     stats = {"wav": len(paths), "annotated": 0, "unannotated": 0, "invalid": 0}
     for path, language in sorted(paths.items()):
-        sidecar = path.with_suffix(".json")
+        sidecar = path.with_suffix(
+            ".json" if audio_mode == "mono" else ".alignment.json"
+        )
         if not sidecar.is_file():
             stats["unannotated"] += 1
             if not include_unannotated:
                 continue
         try:
             info = sf.info(path)
-            if info.channels != 1 or info.frames <= 0:
+            expected_channels = 1 if audio_mode == "mono" else 2
+            if info.channels != expected_channels or info.frames <= 0:
                 stats["invalid"] += 1
                 continue
             entries.append(
@@ -84,6 +96,9 @@ def discover_mono_continuation_entries(
                     "duration": info.frames / info.samplerate,
                     "alignment_path": str(sidecar),
                     "language": language,
+                    "audio_mode": audio_mode,
+                    "user_channel": user_channel,
+                    "assistant_channel": assistant_channel,
                 }
             )
             stats["annotated"] += int(sidecar.is_file())
@@ -326,8 +341,10 @@ def collate_duplex(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 class MonoPostTrainingDataset(StereoDialogueDataset):
-    """Train assistant audio/text on a complete mono utterance.
+    """Use the shared folder/sidecar pipeline for mono or stereo speech.
 
+    Mono mode trains assistant audio/text on a complete utterance with no user
+    audio. Stereo mode preserves the configured user and assistant channels.
     The manifest is JSONL with at least ``path`` and ``duration``. Put word
     alignments inline as ``alignments``, point to a JSON sidecar with
     ``alignment_path``, or place a sidecar next to the WAV (``0.wav`` ->
@@ -348,16 +365,15 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
         min_duration: float = 2.0,
         max_duration: float = 45.0,
         min_text_tokens: int = 0,
-        min_prefix_seconds: float = 1.0,
-        min_suffix_seconds: float = 1.0,
-        gap_seconds: tuple[float, float] = (0.1, 0.5),
-        seed: int = 42,
         entries: list[dict[str, Any]] | None = None,
         folders: str | None = None,
         max_files: int = 0,
         online_alignment: bool = False,
         whisper_model: str = "medium",
         alignment_device: str = "cpu",
+        audio_mode: str = "mono",
+        user_channel: int = 1,
+        assistant_channel: int = 0,
     ) -> None:
         if min_text_tokens < 0:
             raise ValueError("min_text_tokens must be non-negative")
@@ -376,7 +392,13 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
         self.online_alignment = online_alignment
         self.whisper_model = whisper_model
         self.alignment_device = alignment_device
-        self.seed = seed
+        if audio_mode not in {"mono", "stereo"}:
+            raise ValueError(f"unsupported audio mode: {audio_mode!r}")
+        if user_channel == assistant_channel:
+            raise ValueError("user and assistant channels must differ")
+        self.audio_mode = audio_mode
+        self.user_channel = user_channel
+        self.assistant_channel = assistant_channel
         self._alignment_model: Any | None = None
         self.original_size = 0
         self.entries: list[dict[str, Any]] = []
@@ -399,8 +421,13 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
         self.discovery_stats: dict[str, int] | None = None
         discovery_start = time.perf_counter()
         if folders is not None:
-            raw_entries, self.discovery_stats = discover_mono_continuation_entries(
-                folders, max_files=max_files, include_unannotated=online_alignment
+            raw_entries, self.discovery_stats = discover_speech_entries(
+                folders,
+                max_files=max_files,
+                include_unannotated=online_alignment,
+                audio_mode=audio_mode,
+                user_channel=user_channel,
+                assistant_channel=assistant_channel,
             )
         elif entries is None:
             assert self.manifest is not None
@@ -478,6 +505,10 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
             result = annotate.process_one(
                 Path(entry["path"]), None, entry["language"], self._alignment_model,
                 SimpleNamespace(keep_silence_in_segments=1.0),
+                channel=(
+                    int(entry.get("assistant_channel", self.assistant_channel))
+                    if self.audio_mode == "stereo" else 0
+                ),
             )
             alignments = self._validate_alignments(
                 result["alignments"], float(entry["duration"])
@@ -554,12 +585,23 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
         if not alignment_path.is_absolute():
             alignment_path = self.root / alignment_path
         payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+        assistant_channel = int(entry.get("assistant_channel", self.assistant_channel))
+        channel_alignments = payload.get("channel_alignments", {})
+        if self.audio_mode == "stereo" and str(assistant_channel) in channel_alignments:
+            return channel_alignments[str(assistant_channel)]
+        if (
+            self.audio_mode == "stereo"
+            and payload.get("assistant_channel", assistant_channel) != assistant_channel
+            and "all_alignments" in payload
+            and "speakers" in payload
+        ):
+            assistant_speaker = payload["speakers"][assistant_channel]
+            return [
+                alignment
+                for alignment in payload["all_alignments"]
+                if alignment[2] == assistant_speaker
+            ]
         return payload["alignments"]
-
-    @staticmethod
-    def _random_value(seed: int, index: int, path: str) -> float:
-        digest = hashlib.blake2b(f"{seed}:{index}:{path}".encode(), digest_size=8).digest()
-        return int.from_bytes(digest, "big") / 2**64
 
     @staticmethod
     def _validate_alignments(alignments: list[Any], duration: float) -> list[Any]:
@@ -574,37 +616,26 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
             result.append([str(word), [start, end], speaker])
         return sorted(result, key=lambda item: item[1][0])
 
-    @staticmethod
-    def _split_time(
-        duration: float,
-        alignments: list[Any] | None,
-        random_value: float,
-        min_prefix: float,
-        min_suffix: float,
-    ) -> float | None:
-        lower, upper = min_prefix, duration - min_suffix
-        if upper <= lower:
-            return None
-        desired = lower + random_value * (upper - lower)
-        if not alignments:
-            return None
-        # Splitting at a word end preserves both lexical streams.  Do not fall
-        # back to a mid-word split when timestamped text is available.
-        boundaries = [
-            float(item[1][1]) for item in alignments
-            if lower <= float(item[1][1]) <= upper
-            and any(float(other[1][0]) >= float(item[1][1]) for other in alignments)
-            and not any(float(other[1][0]) < float(item[1][1]) < float(other[1][1]) for other in alignments)
-        ]
-        return min(boundaries, key=lambda value: abs(value - desired)) if boundaries else None
-
     def render_stereo(self, index: int) -> tuple[torch.Tensor, torch.Tensor, list[Any] | None]:
-        """Render complete mono speech as assistant audio with no user prompt."""
+        """Render mono post-training or native stereo dialogue streams."""
         entry = self._prepare_lazy_entry(index)
         audio_path = Path(entry["path"])
         if not audio_path.is_absolute():
             audio_path = self.root / audio_path
         wav, _ = sphn.read(audio_path, sample_rate=self.sample_rate)
+        if self.audio_mode == "stereo":
+            if wav.ndim != 2:
+                raise ValueError(f"{audio_path}: stereo training expects multi-channel audio")
+            user_channel = int(entry.get("user_channel", self.user_channel))
+            assistant_channel = int(entry.get("assistant_channel", self.assistant_channel))
+            if user_channel == assistant_channel:
+                raise ValueError(f"{audio_path}: user and assistant channels must differ")
+            for channel in (user_channel, assistant_channel):
+                if not 0 <= channel < wav.shape[0]:
+                    raise ValueError(f"{audio_path}: missing channel {channel}")
+            user = torch.from_numpy(wav[user_channel]).float().clamp(-1.0, 1.0)
+            assistant = torch.from_numpy(wav[assistant_channel]).float().clamp(-1.0, 1.0)
+            return user, assistant, entry["alignments"]
         if wav.ndim == 2 and wav.shape[0] == 1:
             wav = wav[0]
         if wav.ndim != 1:
@@ -636,9 +667,5 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
             "text_only_tokens": text_only_tokens,
             "audio_frame_length": frame_length,
             "assistant_text_frame_length": assistant_text_tokens.numel(),
-            "user_audio_present": False,
+            "user_audio_present": self.audio_mode == "stereo",
         }
-
-
-# Keep older preparation/export scripts import-compatible.
-MonoContinuationDataset = MonoPostTrainingDataset

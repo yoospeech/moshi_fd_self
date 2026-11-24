@@ -1,4 +1,5 @@
 """Regression checks for folder-based mono post-training."""
+import json
 import tempfile
 import types
 import unittest
@@ -9,7 +10,7 @@ import numpy as np
 import soundfile as sf
 
 from full_duplex.dataset import (
-    MonoContinuationDataset,
+    MonoPostTrainingDataset,
     RecoverableSampleError,
     collate_duplex,
 )
@@ -22,6 +23,29 @@ class Tokenizer:
 
 
 class MonoPipelineTests(unittest.TestCase):
+    def test_stereo_folder_uses_native_user_and_assistant_channels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = np.stack([np.full(96000, 0.25), np.full(96000, -0.5)], axis=1)
+            sf.write(root / 'sample.wav', audio, 24000)
+            (root / 'sample.alignment.json').write_text(json.dumps({
+                'assistant_channel': 0,
+                'speakers': ['assistant', 'user'],
+                'channel_alignments': {
+                    '0': [['hello', [1, 2], 'assistant']],
+                    '1': [['there', [1, 2], 'user']],
+                },
+                'alignments': [['hello', [1, 2], 'assistant']],
+            }))
+            ds = MonoPostTrainingDataset(
+                None, Tokenizer(), folders=directory + ':en', audio_mode='stereo',
+                text_padding_id=10, text_epad_id=11, min_duration=0,
+            )
+            item = ds[0]
+            self.assertTrue(item['user_audio_present'])
+            self.assertTrue((item['waveform'] < 0).all())
+            self.assertTrue((item['assistant_waveform'] > 0).all())
+
     def test_lazy_invalid_sample_is_skipped_and_cached_within_split(self):
         class Samples:
             def __init__(self):
@@ -55,9 +79,8 @@ class MonoPipelineTests(unittest.TestCase):
             ]
             for entry in entries:
                 entry['duration'] = 4
-            with patch.object(MonoContinuationDataset, '_split_time', return_value=2):
-                ds = MonoContinuationDataset(None, Tokenizer(), entries=entries,
-                    text_padding_id=10, text_epad_id=11, gap_seconds=(0, 0))
+            ds = MonoPostTrainingDataset(None, Tokenizer(), entries=entries,
+                text_padding_id=10, text_epad_id=11)
             self.assertEqual(len(ds), 1)
             self.assertEqual(ds.rejected['alignment'], 3)
             self.assertEqual(ds.rejected['text_collision'], 1)
@@ -70,7 +93,7 @@ class MonoPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sf.write(Path(directory) / 'sample.wav', np.zeros(96000), 24000)
             with patch.dict('sys.modules', {'scripts.annotate': annotation}):
-                ds = MonoContinuationDataset(None, Tokenizer(), folders=directory + ':ko',
+                ds = MonoPostTrainingDataset(None, Tokenizer(), folders=directory + ':ko',
                     online_alignment=True, text_padding_id=10, text_epad_id=11)
                 self.assertFalse(annotation.process_one.called)
                 batch = collate_duplex([ds[0]])
@@ -83,13 +106,9 @@ class MonoPipelineTests(unittest.TestCase):
             self.assertEqual(batch['languages'], ['ko'])
             self.assertEqual(batch['waveforms'].shape, batch['assistant_waveforms'].shape)
 
-    def test_overlapping_words_cannot_be_split(self):
-        words = [['one', [0, 2], 'S'], ['two', [1.9, 3], 'S']]
-        self.assertIsNone(MonoContinuationDataset._split_time(4, words, 0.5, 1, 1))
-
     def test_nonfinite_timestamp_rejected(self):
         with self.assertRaises(ValueError):
-            MonoContinuationDataset._validate_alignments([['word', [0, float('nan')], 'S']], 4)
+            MonoPostTrainingDataset._validate_alignments([['word', [0, float('nan')], 'S']], 4)
 
     def test_minimum_mono_bpe_tokens_eager_and_online(self):
         for lazy in (False, True):
@@ -101,11 +120,11 @@ class MonoPipelineTests(unittest.TestCase):
                     entry = {'path': 'sample.wav', 'duration': 4, 'language': 'en',
                              'alignments': None if lazy else words}
                     kwargs = dict(text_padding_id=10, text_epad_id=11,
-                                  min_text_tokens=5, gap_seconds=(0, 0))
-                    with patch('full_duplex.dataset.discover_mono_continuation_entries',
+                                  min_text_tokens=5)
+                    with patch('full_duplex.dataset.discover_speech_entries',
                                return_value=([entry], {})):
                         if lazy:
-                            ds = MonoContinuationDataset(None, tokenizer, folders='unused:en',
+                            ds = MonoPostTrainingDataset(None, tokenizer, folders='unused:en',
                                                          online_alignment=True, **kwargs)
                             with patch.object(ds, '_extract_alignment', return_value=words):
                                 if count < 5:
@@ -117,8 +136,8 @@ class MonoPipelineTests(unittest.TestCase):
                                     ds._prepare_lazy_entry(0)
                         elif count < 5:
                             with self.assertRaisesRegex(ValueError, 'empty mono post-training dataset'):
-                                MonoContinuationDataset(None, tokenizer, entries=[entry], **kwargs)
+                                MonoPostTrainingDataset(None, tokenizer, entries=[entry], **kwargs)
                         else:
-                            ds = MonoContinuationDataset(None, tokenizer, entries=[entry], **kwargs)
+                            ds = MonoPostTrainingDataset(None, tokenizer, entries=[entry], **kwargs)
                             self.assertEqual(len(ds), 1)
                         tokenizer.encode.assert_any_call(' utterance', add_special_tokens=False)

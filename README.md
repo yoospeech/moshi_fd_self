@@ -47,7 +47,7 @@ that PyTorch); matching version numbers alone does not guarantee binary compatib
 
 ```text
 full_duplex/model.py       model, streams, Depth Transformer and losses
-full_duplex/dataset.py     stereo dialogue and mono continuation datasets
+full_duplex/dataset.py     shared mono/stereo post-training datasets
 full_duplex/train.py       single-GPU/DDP training, validation and timing
 full_duplex/inference.py   user-conditioned assistant text/audio generation
 scripts/annotate.py        word alignment extraction

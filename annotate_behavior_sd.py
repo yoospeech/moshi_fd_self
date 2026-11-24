@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import importlib
 import json
 import os
 import traceback
@@ -20,6 +22,8 @@ import whisper_timestamped as whisper
 
 
 SAMPLE_RATE = 16_000
+transcribe = importlib.import_module("whisper_timestamped.transcribe")
+old_get_vad_segments = transcribe.get_vad_segments
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,9 +55,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--vad",
-        choices=("none", "auditok", "silero"),
-        default="none",
-        help="Optional voice activity detector (default: none; stereo channels are already speaker-isolated).",
+        choices=("auto", "none", "auditok", "silero"),
+        default="auto",
+        help=(
+            "Voice activity detector. Auto matches scripts/annotate.py and uses "
+            "auditok for audio longer than 10 seconds (default: auto)."
+        ),
+    )
+    parser.add_argument(
+        "--keep-silence-in-segments",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help=(
+            "Restore this much silence at VAD segment boundaries, matching "
+            "scripts/annotate.py (default: 1.0)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -100,18 +117,42 @@ def transcribe_channel(
         channel: int,
         speaker: str,
         language: str,
-        vad: str) -> tuple[list[list[Any]], list[dict]]:
+        vad: str,
+        keep_silence_in_segments: float) -> tuple[list[list[Any]], list[dict]]:
     """Transcribe one isolated speaker channel into word and Whisper-segment alignments."""
 
-    waveform = torch.from_numpy(np.asarray(audio[channel], dtype=np.float32))[None]
-    if sample_rate != SAMPLE_RATE:
-        waveform = audio_functional.resample(waveform, sample_rate, SAMPLE_RATE)
-    samples = waveform.numpy()[0]
+    model_device = next(model.parameters()).device
+    waveform = torch.from_numpy(
+        np.asarray(audio[channel], dtype=np.float32)
+    )[None].to(model_device)
+    waveform = audio_functional.resample(waveform, sample_rate, SAMPLE_RATE)
+    samples = waveform.cpu().numpy()[0]
+    duration = samples.shape[-1] / SAMPLE_RATE
+
+    def new_get_vad_segments(*args, **kwargs):
+        vad_segments = old_get_vad_segments(*args, **kwargs)
+        outputs = []
+        last_end = 0
+        boundary_samples = int(SAMPLE_RATE * keep_silence_in_segments)
+        for segment in vad_segments:
+            outputs.append({
+                "start": max(last_end, segment["start"] - boundary_samples),
+                "end": segment["end"] + boundary_samples,
+            })
+            last_end = outputs[-1]["end"]
+        return outputs
+
+    if keep_silence_in_segments:
+        transcribe.get_vad_segments = new_get_vad_segments
+
+    selected_vad = "auditok" if vad == "auto" and duration > 10 else None
+    if vad not in {"auto", "none"}:
+        selected_vad = vad
     result = whisper.transcribe(
         model,
         samples,
         language=language,
-        vad=None if vad == "none" else vad,
+        vad=selected_vad,
         best_of=5,
         beam_size=5,
         temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
@@ -144,20 +185,34 @@ def process_one(
         model: Any,
         language: str,
         vad: str,
-        assistant_channel: int) -> None:
+        assistant_channel: int,
+        keep_silence_in_segments: float) -> None:
     """Align both stereo channels and write one merged annotation."""
 
+    gc.collect()
+    if next(model.parameters()).device.type == "cuda":
+        torch.cuda.empty_cache()
     metadata = load_metadata(audio_path)
     audio, sample_rate = sphn.read(audio_path)
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim != 2 or audio.shape[0] != 2:
         raise ValueError(f"Expected [2, samples] stereo audio in {audio_path}, got {audio.shape}")
+    duration = audio.shape[-1] / sample_rate
+    if duration > 3600 * 4:
+        raise RuntimeError("File is too long for now.")
 
     channel_alignments = {}
     segments = []
     for channel, speaker in enumerate(metadata["speakers"]):
         channel_words, channel_segments = transcribe_channel(
-            model, audio, sample_rate, channel, speaker, language, vad
+            model,
+            audio,
+            sample_rate,
+            channel,
+            speaker,
+            language,
+            vad,
+            keep_silence_in_segments,
         )
         channel_alignments[channel] = channel_words
         segments.extend(channel_segments)
@@ -186,10 +241,12 @@ def process_one(
     output = {
         "audio": str(audio_path),
         "sample_rate": sample_rate,
+        "duration": duration,
         "speakers": metadata["speakers"],
         "assistant_channel": assistant_channel,
         "assistant_speaker": metadata["speakers"][assistant_channel],
         "alignments": alignments,
+        "channel_alignments": channel_alignments,
         "all_alignments": all_alignments,
         "sentence_alignments": sentence_alignments,
         "segments": segments,
@@ -259,7 +316,13 @@ def main(args: argparse.Namespace) -> None:
             continue
         try:
             process_one(
-                audio_path, output_path, model, args.language, args.vad, args.assistant_channel
+                audio_path,
+                output_path,
+                model,
+                args.language,
+                args.vad,
+                args.assistant_channel,
+                args.keep_silence_in_segments,
             )
             error_path.unlink(missing_ok=True)
             completed += 1
@@ -270,10 +333,6 @@ def main(args: argparse.Namespace) -> None:
             print(f"[{index}/{len(audio_paths)}] failed {audio_path.name}: see {error_path}")
             if "cuda" in error_path.read_text(encoding="utf-8").lower():
                 raise
-        finally:
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
-
     print(f"Done: completed={completed}, skipped={skipped}, failed={failed}")
 
 

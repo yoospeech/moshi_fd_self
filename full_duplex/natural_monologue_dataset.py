@@ -20,6 +20,87 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import PreTrainedTokenizerBase
 
 
+def discover_behavior_sd_entries(
+    folders: str,
+    *,
+    max_files: int = 0,
+    assistant_channel: int = 0,
+    user_channel: int = 1,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Discover adjacent Behavior-SD audio/JSON pairs from folder inputs."""
+    import soundfile as sf
+
+    if max_files < 0:
+        raise ValueError("max_files must be non-negative")
+    sources: list[tuple[Path, str]] = []
+    for part in folders.split(","):
+        value = part.strip()
+        if not value or ":" not in value:
+            raise ValueError(f"use folder:language input, got {value!r}")
+        folder, language = value.rsplit(":", 1)
+        root = Path(folder).expanduser().resolve()
+        if not root.is_dir() or not language.strip():
+            raise ValueError(f"invalid folder:language input: {value!r}")
+        source = (root, language.strip())
+        if source not in sources:
+            sources.append(source)
+
+    entries: list[dict[str, Any]] = []
+    stats = {"audio": 0, "paired": 0, "invalid": 0}
+    for root, language in sources:
+        for audio_path in root.rglob("*.wav"):
+            stats["audio"] += 1
+            metadata_path = audio_path.with_suffix(".json")
+            if not metadata_path.is_file():
+                stats["invalid"] += 1
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if Path(str(metadata["file_name"])).stem != audio_path.stem:
+                    raise ValueError("metadata file_name stem does not match audio")
+                monologues: list[dict[str, Any]] = []
+                for utterance in metadata["utterances"]:
+                    speaker = int(utterance["speaker_idx"])
+                    if speaker == assistant_channel:
+                        text = str(utterance.get("tts_text", "")).strip()
+                        if text:
+                            monologues.append({
+                                "start": float(utterance["start_time"]),
+                                "text": text,
+                            })
+                    else:
+                        # Nested backchannels are spoken by the listener.
+                        for backchannel in utterance.get("backchannels", []):
+                            text = str(backchannel.get("tts_text", "")).strip()
+                            if text:
+                                monologues.append({
+                                    "start": float(backchannel["start_time"]),
+                                    "text": text,
+                                })
+                if not monologues:
+                    raise ValueError("no assistant text")
+                monologues.sort(key=lambda item: item["start"])
+                info = sf.info(audio_path)
+                if info.channels != 2 or info.frames <= 0:
+                    raise ValueError("expected nonempty stereo audio")
+            except (KeyError, TypeError, ValueError, OSError, RuntimeError, json.JSONDecodeError):
+                stats["invalid"] += 1
+                continue
+            entries.append({
+                "id": metadata_path.stem,
+                "path": str(audio_path.resolve()),
+                "duration": info.frames / info.samplerate,
+                "language": language,
+                "user_channel": user_channel,
+                "assistant_channel": assistant_channel,
+                "assistant_texts": monologues,
+            })
+            stats["paired"] += 1
+            if max_files and len(entries) >= max_files:
+                return entries, stats
+    return entries, stats
+
+
 class NaturalMonologueDataset(Dataset[dict[str, Any]]):
     """Load stereo dialogue without word-level alignment.
 
@@ -43,7 +124,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
 
     def __init__(
         self,
-        manifest: str | Path,
+        manifest: str | Path | None,
         tokenizer: PreTrainedTokenizerBase,
         *,
         wait_token_id: int,
@@ -60,9 +141,16 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         vad_min_speech_duration: float = 0.1,
         vad_min_silence_duration: float = 0.1,
         vad_energy_threshold: float = 50.0,
+        enable_sine_conditioning: bool = False,
+        sine_frequency: float = 440.0,
+        sine_amplitude: float = 0.5,
+        folders: str | None = None,
+        max_files: int = 0,
     ) -> None:
-        self.manifest = Path(manifest)
-        self.root = self.manifest.parent
+        if (manifest is None) == (folders is None):
+            raise ValueError("provide exactly one of manifest or folders")
+        self.manifest = Path(manifest) if manifest is not None else None
+        self.root = self.manifest.parent if self.manifest is not None else Path.cwd()
         self.tokenizer = tokenizer
         self.wait_token_id = int(wait_token_id)
         self.spk_token_id = int(spk_token_id)
@@ -76,6 +164,9 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         self.vad_min_speech_duration = float(vad_min_speech_duration)
         self.vad_min_silence_duration = float(vad_min_silence_duration)
         self.vad_energy_threshold = float(vad_energy_threshold)
+        self.enable_sine_conditioning = bool(enable_sine_conditioning)
+        self.sine_frequency = float(sine_frequency)
+        self.sine_amplitude = float(sine_amplitude)
 
         if len({self.wait_token_id, self.spk_token_id, self.hear_token_id}) != 3:
             raise ValueError("WAIT, SPK, and HEAR token IDs must be distinct")
@@ -89,9 +180,23 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             raise ValueError("min_text_tokens must be non-negative")
         if self.vad_min_speech_duration <= 0 or self.vad_min_silence_duration < 0:
             raise ValueError("VAD durations must be non-negative and speech must be positive")
+        if not math.isfinite(self.sine_frequency) or self.sine_frequency <= 0:
+            raise ValueError("sine_frequency must be positive and finite")
+        if not math.isfinite(self.sine_amplitude) or not 0 <= self.sine_amplitude <= 1:
+            raise ValueError("sine_amplitude must be finite and between 0 and 1")
 
-        with self.manifest.open(encoding="utf-8") as handle:
-            raw_entries = [json.loads(line) for line in handle if line.strip()]
+        self.discovery_stats: dict[str, int] | None = None
+        if folders is not None:
+            raw_entries, self.discovery_stats = discover_behavior_sd_entries(
+                folders,
+                max_files=max_files,
+                assistant_channel=assistant_channel,
+                user_channel=user_channel,
+            )
+        else:
+            assert self.manifest is not None
+            with self.manifest.open(encoding="utf-8") as handle:
+                raw_entries = [json.loads(line) for line in handle if line.strip()]
         self.original_size = len(raw_entries)
         self.rejected = {"duration": 0, "annotation": 0, "text_tokens": 0}
         self.entries: list[dict[str, Any]] = []
@@ -114,7 +219,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 continue
             self.entries.append(entry)
         if not self.entries:
-            raise ValueError(f"empty natural-monologue manifest: {self.manifest}")
+            raise ValueError(f"empty natural-monologue input: {self.manifest or folders}")
         self.filtered_hours = sum(float(item["duration"]) for item in self.entries) / 3600
 
     def _validate_entry(self, raw: dict[str, Any], entry_index: int) -> dict[str, Any]:
@@ -221,7 +326,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         frame_length: int,
         user_intervals: list[tuple[float, float]],
         assistant_intervals: list[tuple[float, float]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         user_active = torch.zeros(frame_length, dtype=torch.bool)
         assistant_active = torch.zeros(frame_length, dtype=torch.bool)
         for target, intervals in (
@@ -256,6 +361,12 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             )
             required = start + len(pieces)
             if required > stream.numel():
+                if self.enable_sine_conditioning:
+                    raise ValueError(
+                        f"{entry['path']}: assistant text requires {required} frames "
+                        f"but audio has only {frame_length}; sine conditioning requires "
+                        "the complete text timeline to fit inside the audio timeline"
+                    )
                 extension = required - stream.numel()
                 stream = torch.cat(
                     [
@@ -270,7 +381,35 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 )
             stream[start:required] = torch.tensor(pieces, dtype=torch.long)
             lexical[start:required] = True
-        return stream, torch.tensor(dense_text, dtype=torch.long)
+        # Only original audio frames can condition Mimi. Lexical text may extend
+        # past the audio timeline, so never extend the acoustic mask with it.
+        sine_mask = user_active & lexical[:frame_length] & ~assistant_active
+        return stream, torch.tensor(dense_text, dtype=torch.long), sine_mask
+
+    def _apply_sine_conditioning(
+        self, assistant: torch.Tensor, sine_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Replace only selected assistant-silence samples with a sine wave."""
+        if not self.enable_sine_conditioning or not sine_mask.any():
+            return assistant
+        samples_per_frame = int(self.sample_rate / self.frame_rate)
+        if samples_per_frame < 1:
+            raise ValueError("frame_rate cannot exceed sample_rate")
+        sample_mask = sine_mask.repeat_interleave(samples_per_frame)
+        if sample_mask.numel() < assistant.numel():
+            sample_mask = torch.nn.functional.pad(
+                sample_mask, (0, assistant.numel() - sample_mask.numel()), value=False
+            )
+        sample_mask = sample_mask[:assistant.numel()].to(device=assistant.device)
+        time = torch.arange(
+            assistant.numel(), dtype=torch.float32, device=assistant.device
+        ) / self.sample_rate
+        sine = self.sine_amplitude * torch.sin(
+            2 * math.pi * self.sine_frequency * time
+        )
+        conditioned = assistant.clone()
+        conditioned[sample_mask] = sine.to(dtype=conditioned.dtype)[sample_mask]
+        return conditioned
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         entry = self.entries[index]
@@ -296,10 +435,12 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         )
         user_intervals = self._vad_intervals(user)
         assistant_intervals = self._vad_intervals(assistant)
-        text, dense_text = self._text_stream(
+        text, dense_text, sine_mask = self._text_stream(
             entry, frame_length, user_intervals, assistant_intervals
         )
-        return {
+        original_assistant = assistant
+        assistant = self._apply_sine_conditioning(assistant, sine_mask)
+        result = {
             "id": str(entry.get("id", audio_path.stem)),
             "language": str(entry.get("language", "unknown")),
             "waveform": user,
@@ -312,6 +453,14 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             "user_vad_intervals": user_intervals,
             "assistant_vad_intervals": assistant_intervals,
         }
+        if self.enable_sine_conditioning:
+            result.update(
+                original_assistant_waveform=original_assistant,
+                sine_mask=sine_mask,
+                sine_frames=int(sine_mask.sum()),
+                sine_duration=float(sine_mask.sum()) / self.frame_rate,
+            )
+        return result
 
 
 def collate_natural_monologue(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -352,6 +501,81 @@ def collate_natural_monologue(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "ids": [item["id"] for item in batch],
         "languages": [item["language"] for item in batch],
     }
+
+
+def write_natural_monologue_debug(
+    item: dict[str, Any],
+    output_prefix: str | Path,
+    dataset: NaturalMonologueDataset,
+) -> dict[str, Any]:
+    """Write stereo audio, aligned masks/tokens, and sine statistics for one item.
+
+    The WAV contains user audio on channel 0 and the conditioned assistant on
+    channel 1. The PNG also includes the unmodified assistant waveform.
+    Matplotlib is imported lazily so training has no visualization dependency.
+    """
+    import matplotlib.pyplot as plt
+
+    prefix = Path(output_prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    wav_path = prefix.with_suffix(".wav")
+    plot_path = prefix.with_suffix(".png")
+    stats_path = prefix.with_suffix(".json")
+    user = item["waveform"].detach().cpu()
+    original = item["original_assistant_waveform"].detach().cpu()
+    modified = item["assistant_waveform"].detach().cpu()
+    stereo = torch.stack([user, modified]).numpy()
+    sphn.write_wav(str(wav_path), stereo, dataset.sample_rate)
+
+    frame_length = int(item["audio_frame_length"])
+    user_mask = torch.zeros(frame_length, dtype=torch.bool)
+    assistant_mask = torch.zeros(frame_length, dtype=torch.bool)
+    for target, key in (
+        (user_mask, "user_vad_intervals"),
+        (assistant_mask, "assistant_vad_intervals"),
+    ):
+        for start, end in item[key]:
+            interval = dataset._frame_interval(start, end, frame_length)
+            target[interval.start:interval.stop] = True
+    tokens = item["assistant_text_tokens"][:frame_length].detach().cpu()
+    lexical = ~torch.isin(
+        tokens,
+        torch.tensor(
+            [dataset.wait_token_id, dataset.spk_token_id, dataset.hear_token_id]
+        ),
+    )
+    sine_mask = item["sine_mask"].detach().cpu()
+    time = torch.arange(user.numel()) / dataset.sample_rate
+    frame_time = torch.arange(frame_length) / dataset.frame_rate
+    panels = (
+        ("User waveform", time, user),
+        ("Original assistant", time, original),
+        ("Modified assistant", time, modified),
+        ("User VAD", frame_time, user_mask),
+        ("Assistant VAD", frame_time, assistant_mask),
+        ("Assistant BPE", frame_time, lexical),
+        ("Sine mask", frame_time, sine_mask),
+        ("Final assistant text tokens", frame_time, tokens),
+    )
+    figure, axes = plt.subplots(len(panels), 1, figsize=(14, 14), sharex=False)
+    for axis, (title, x, values) in zip(axes, panels, strict=True):
+        axis.plot(x.numpy(), values.numpy(), linewidth=0.8)
+        axis.set_title(title)
+        axis.grid(alpha=0.2)
+    figure.tight_layout()
+    figure.savefig(plot_path, dpi=150)
+    plt.close(figure)
+    sine_frames = int(sine_mask.sum())
+    stats = {
+        "frames": frame_length,
+        "sine_frames": sine_frames,
+        "sine_frame_ratio": sine_frames / frame_length if frame_length else 0.0,
+        "sine_duration_seconds": sine_frames / dataset.frame_rate,
+        "wav": str(wav_path),
+        "plot": str(plot_path),
+    }
+    stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    return stats
 
 
 def create_natural_monologue_dataloader(

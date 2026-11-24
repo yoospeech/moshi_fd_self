@@ -29,6 +29,11 @@ from .dataset import (
     collate_duplex,
 )
 from .distributed import TrainingObjective, setup, barrier
+from .natural_monologue_dataset import (
+    NaturalMonologueDataset,
+    collate_natural_monologue,
+)
+from .tokenizer import add_control_tokens
 
 from moshi.models import loaders as moshi_loaders
 
@@ -115,6 +120,20 @@ def resolve_model_source(model: str, download_root: str) -> tuple[Path, str | No
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
+    parser.add_argument(
+        "--natural-monologue", action="store_true",
+        help="use the VAD-driven NaturalMonologueDataset for --task finetuning",
+    )
+    parser.add_argument("--wait-token-id", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--spk-token-id", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--hear-token-id", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--enable-sine-conditioning", action="store_true",
+        help="replace assistant silence with sine only where user speech and leading BPE overlap",
+    )
+    parser.add_argument("--sine-frequency", type=float, default=440.0)
+    parser.add_argument("--sine-amplitude", type=float, default=0.5)
+    parser.add_argument("--monologue-lead-frames", type=int, default=1)
     parser.add_argument("--resume", type=Path,
                         help="resume model, optimizer and step from a local checkpoint; steps is the total target")
     parser.add_argument("--alignment-mode", choices=("online", "sidecar"), default="online",
@@ -501,6 +520,10 @@ def run_training() -> None:
         raise ValueError("text-only-fraction must be between 0 and 1")
     if not 0.0 <= args.audio_text_mask_probability <= 1.0:
         raise ValueError("audio-text-mask-probability must be between 0 and 1")
+    if args.natural_monologue and args.task != "finetuning":
+        raise ValueError("--natural-monologue requires --task finetuning")
+    if args.enable_sine_conditioning and not args.natural_monologue:
+        raise ValueError("--enable-sine-conditioning requires --natural-monologue")
     for name in ("batch_size", "grad_accum", "steps", "smoke_steps", "log_every", "save_every", "valid_every"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
@@ -534,6 +557,27 @@ def run_training() -> None:
         model_name,
         trust_remote_code=trust_remote_code,
     )
+    control_ids = None
+    if args.natural_monologue:
+        control_ids = add_control_tokens(tokenizer)
+        explicit_ids = {
+            "wait": args.wait_token_id,
+            "spk": args.spk_token_id,
+            "hear": args.hear_token_id,
+        }
+        for name, value in explicit_ids.items():
+            if value is not None and value != control_ids[name]:
+                raise ValueError(
+                    f"--{name}-token-id={value} disagrees with tokenizer {name.upper()} ID "
+                    f"{control_ids[name]}"
+                )
+        if primary:
+            print(f"registered control tokens: {control_ids}", flush=True)
+        tokenizer_output = Path(args.output) / "tokenizer"
+        if primary:
+            tokenizer_output.mkdir(parents=True, exist_ok=True)
+            tokenizer.save_pretrained(tokenizer_output)
+        barrier()
     tokenizer_seconds = time.perf_counter() - tokenizer_start
     base_text_card = len(tokenizer)
     # PAD and EPAD are shared vocabulary rows; timelines and heads are separate.
@@ -556,6 +600,9 @@ def run_training() -> None:
         text_loss_weight=args.text_loss_weight,
         semantic_loss_weight=args.semantic_loss_weight,
         text_padding_weight=args.text_padding_weight,
+        wait_token_id=control_ids["wait"] if control_ids else None,
+        spk_token_id=control_ids["spk"] if control_ids else None,
+        hear_token_id=control_ids["hear"] if control_ids else None,
     )
     model_start = time.perf_counter()
     if resume_config is not None:
@@ -708,7 +755,34 @@ def run_training() -> None:
         else:
             if args.folders and args.manifest:
                 raise SystemExit("pass either --folders or --manifest, not both")
-            if args.folders:
+            if args.natural_monologue:
+                if args.folders is None and args.manifest is None:
+                    raise SystemExit(
+                        "--natural-monologue requires --folders or --manifest"
+                    )
+                if control_ids is None:
+                    raise RuntimeError("natural-monologue tokenizer control tokens were not registered")
+                dataset = NaturalMonologueDataset(
+                    args.manifest,
+                    tokenizer,
+                    wait_token_id=control_ids["wait"],
+                    spk_token_id=control_ids["spk"],
+                    hear_token_id=control_ids["hear"],
+                    sample_rate=24000,
+                    frame_rate=config.frame_rate,
+                    monologue_lead_frames=args.monologue_lead_frames,
+                    min_duration=args.min_duration,
+                    max_duration=args.max_duration,
+                    min_text_tokens=args.min_text_tokens,
+                    enable_sine_conditioning=args.enable_sine_conditioning,
+                    sine_frequency=args.sine_frequency,
+                    sine_amplitude=args.sine_amplitude,
+                    folders=args.folders,
+                    max_files=args.max_files,
+                )
+                if dataset.discovery_stats is not None:
+                    print(f"folder discovery: {dataset.discovery_stats}")
+            elif args.folders:
                 dataset = MonoPostTrainingDataset(
                     None,
                     tokenizer,
@@ -778,6 +852,11 @@ def run_training() -> None:
             and args.alignment_mode == "online"
             and bool(args.folders)
         )
+        dataset_collate = (
+            collate_natural_monologue
+            if isinstance(dataset, NaturalMonologueDataset)
+            else collate_duplex
+        )
         if lazy_folder_alignment:
             train_dataset = SkipInvalidDataset(train_dataset)
             valid_dataset = SkipInvalidDataset(valid_dataset)
@@ -798,7 +877,7 @@ def run_training() -> None:
             # DataLoader workers. Prepared alignments remain cached in memory.
             num_workers=0 if lazy_folder_alignment else 2,
             pin_memory=device.type == "cuda",
-            collate_fn=collate_duplex,
+            collate_fn=dataset_collate,
         )
         valid_loader = DataLoader(
             valid_dataset,
@@ -806,7 +885,7 @@ def run_training() -> None:
             shuffle=False,
             num_workers=0 if lazy_folder_alignment else 2,
             pin_memory=device.type == "cuda",
-            collate_fn=collate_duplex,
+            collate_fn=dataset_collate,
         )
         print(f"dataset split: train={train_size} valid={valid_size} seed={args.seed}")
         batches = loader

@@ -14,6 +14,7 @@ import torch
 from transformers import AutoTokenizer
 
 from .model import FullDuplexConfig, MoshiFullDuplexModel
+from .tokenizer import add_control_tokens
 from moshi.models import loaders as moshi_loaders
 from moshi.models.lm_utils import _undelay_sequence
 
@@ -343,10 +344,23 @@ def main() -> None:
     )
     print(f"loading model on {device} with dtype={dtype}", flush=True)
 
+    tokenizer_path = Path(args.checkpoint).parent / "tokenizer"
+    tokenizer_source = tokenizer_path if tokenizer_path.exists() else config.temporal_model
     tokenizer = AutoTokenizer.from_pretrained(
-        config.temporal_model,
+        tokenizer_source,
         trust_remote_code=config.trust_remote_code,
     )
+    if config.wait_token_id is not None:
+        control_ids = add_control_tokens(tokenizer)
+        expected = {
+            "wait": config.wait_token_id,
+            "spk": config.spk_token_id,
+            "hear": config.hear_token_id,
+        }
+        if control_ids != expected:
+            raise ValueError(
+                f"checkpoint control-token IDs {expected} do not match tokenizer IDs {control_ids}"
+            )
     model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
     if args.disable_lfm3_triton:
         temporal_module = importlib.import_module(model.transformer.__class__.__module__)

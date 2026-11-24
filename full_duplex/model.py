@@ -42,6 +42,9 @@ class FullDuplexConfig:
     text_padding_weight: float = 0.5
     text_padding_id: int = 49152
     text_epad_id: int = 49153
+    wait_token_id: int | None = None
+    spk_token_id: int | None = None
+    hear_token_id: int | None = None
 
     @property
     def text_delay_steps(self) -> int:

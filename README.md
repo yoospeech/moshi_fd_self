@@ -48,6 +48,7 @@ that PyTorch); matching version numbers alone does not guarantee binary compatib
 ```text
 full_duplex/model.py       model, streams, Depth Transformer and losses
 full_duplex/dataset.py     shared mono/stereo post-training datasets
+full_duplex/natural_monologue_dataset.py  VAD-driven text-leading monologues
 full_duplex/train.py       single-GPU/DDP training, validation and timing
 full_duplex/inference.py   user-conditioned assistant text/audio generation
 scripts/annotate.py        word alignment extraction
@@ -55,3 +56,53 @@ train_full_duplex.py       training CLI
 infer_full_duplex.py       inference CLI
 tests/                     regression tests
 ```
+
+## Natural Monologue sine conditioning
+
+Natural Monologue training can optionally add a sine-wave acoustic target where
+leading assistant BPE replaces a HEAR control token while the user is speaking
+and the assistant audio is still silent. It does not modify user audio,
+assistant speech, VAD, text placement, sequence lengths, Mimi delay, the model,
+or either loss. The feature is disabled by default.
+
+The frame condition is:
+
+    user VAD active AND assistant BPE active AND assistant VAD inactive
+
+The resulting raw frame layout remains
+`assistant_text | assistant_Mimi | user_Mimi`. Moshi's existing delay pattern
+is then applied to the two audio groups (`[0, 1, 1, 1]` per Mimi stream); the
+control symbols live only in the assistant text stream and do not consume an
+audio codebook slot.
+
+Enable it with a VAD-driven natural manifest or a Behavior-SD folder containing
+adjacent same-stem WAV/JSON pairs. Training registers
+`<WAIT>`, `<SPK>`, and `<HEAR>` as tokenizer special tokens, saves that tokenizer
+next to the checkpoint, and uses the resulting IDs consistently:
+
+    PYTHONPATH=. /home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
+      train_full_duplex.py \
+      --task finetuning --natural-monologue \
+      --folders '/path/to/behavior-sd/validation:en' \
+      --enable-sine-conditioning \
+      --sine-frequency 440 --sine-amplitude 0.5 \
+      --monologue-lead-frames 1 \
+      --model models/LFM3-1.7B --batch-size 4 --steps 1000 \
+      --output runs/natural_sine
+
+When enabled, a text timeline that exceeds its audio timeline is treated as
+invalid and stops loading rather than truncating conditioning. The default
+disabled mode preserves the previous Natural Monologue behavior.
+
+For one Behavior-SD JSON/WAV pair, generate a stereo WAV (user, conditioned
+assistant), an aligned eight-panel PNG, and JSON sine statistics with:
+
+    PYTHONPATH=. /home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
+      scripts/debug_natural_monologue_sine.py \
+      --metadata /path/to/behavior-sd/validation/0001/0000003623.json \
+      --output-prefix /tmp/natural_sine_debug
+
+Pass the exact training Mimi file through --mimi-checkpoint to also report
+changed Mimi token/frame counts. No PersonaPlex SINE_TOKENS are hardcoded.
+The sine is a training-only acoustic conditioning target, not user-facing
+assistant speech. Muting or suppressing it during inference is separate work.

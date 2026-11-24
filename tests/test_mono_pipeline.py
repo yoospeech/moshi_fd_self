@@ -110,6 +110,20 @@ class MonoPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MonoPostTrainingDataset._validate_alignments([['word', [0, float('nan')], 'S']], 4)
 
+    def test_small_final_timestamp_overrun_is_clamped(self):
+        alignments = [['hello', [1, 2], 'S'], ['call.', [100.27, 100.29], 'S']]
+        validated = MonoPostTrainingDataset._validate_alignments(alignments, 100.23319)
+        self.assertEqual(validated[-1], ['call.', [100.23319, 100.23319], 'S'])
+        with self.assertRaisesRegex(ValueError, "word='bad'"):
+            MonoPostTrainingDataset._validate_alignments(
+                [['bad', [100.27, 100.5], 'S']], 100.23319
+            )
+        with self.assertRaisesRegex(ValueError, "word='middle'"):
+            MonoPostTrainingDataset._validate_alignments(
+                [['middle', [100.22, 100.24], 'S'], ['last', [100.23, 100.23], 'S']],
+                100.23319,
+            )
+
     def test_minimum_mono_bpe_tokens_eager_and_online(self):
         for lazy in (False, True):
             for count in (4, 5):

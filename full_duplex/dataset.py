@@ -623,7 +623,7 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
 
     @staticmethod
     def _validate_alignments(alignments: list[Any], duration: float) -> list[Any]:
-        result = []
+        parsed = []
         for index, alignment in enumerate(alignments):
             if len(alignment) != 3:
                 raise ValueError(
@@ -631,13 +631,32 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
                 )
             word, timestamps, speaker = alignment
             start, end = map(float, timestamps)
-            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start or end > duration + 0.05:
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start:
                 raise ValueError(
                     f"alignment[{index}] word={word!r} has invalid timestamp "
                     f"start={start} end={end} duration={duration}"
                 )
-            result.append([str(word), [start, end], speaker])
-        return sorted(result, key=lambda item: item[1][0])
+            parsed.append((index, str(word), start, end, speaker))
+
+        parsed.sort(key=lambda item: item[2])
+        result = []
+        for position, (index, word, start, end, speaker) in enumerate(parsed):
+            if end > duration:
+                # Whisper timestamps are quantized and VAD timestamp restoration
+                # can put the final word a few milliseconds beyond the WAV.
+                # Clamp that boundary case, while rejecting genuinely corrupt
+                # timestamps and out-of-range words in the middle of a sample.
+                is_last = position == len(parsed) - 1
+                if is_last and end <= duration + 0.1:
+                    start = min(start, duration)
+                    end = duration
+                else:
+                    raise ValueError(
+                        f"alignment[{index}] word={word!r} has invalid timestamp "
+                        f"start={start} end={end} duration={duration}"
+                    )
+            result.append([word, [start, end], speaker])
+        return result
 
     def render_stereo(self, index: int) -> tuple[torch.Tensor, torch.Tensor, list[Any] | None]:
         """Render mono post-training or native stereo dialogue streams."""

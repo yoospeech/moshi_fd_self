@@ -87,7 +87,9 @@ Use `--alignment-mode sidecar` to require pre-existing JSON files.
 Skipped online samples report their failure stage and original error. The stages
 are `transcription_failed`, `empty_alignment`, `timestamp_validation_failed`,
 and `text_tokens_failed`. CUDA out-of-memory errors remain fatal rather than
-being treated as invalid samples.
+being treated as invalid samples. A final word ending no more than 100 ms past
+the WAV boundary is clamped to the actual duration; larger overruns and
+out-of-range words before the final word are rejected.
 
 Folder language labels are passed to Whisper and returned in
 `batch["languages"]`. They do not balance languages or condition the model.

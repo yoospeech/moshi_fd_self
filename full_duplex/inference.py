@@ -131,6 +131,7 @@ def generate_assistant_text(
     device = model.device
     audio_codes = audio_codes.to(device)
     initial = model._get_initial_token()
+    delay_padding = model.delay_padding()
     pattern = initial
     generated = [[]]
     total_pattern_steps = audio_codes.shape[-1] + max(config.delays)
@@ -164,13 +165,13 @@ def generate_assistant_text(
             source = step - delay
             assistant_index = codebook + model.audio_offset
             frame[:, assistant_index, 0] = (
-                model.initial_token_id if source < 0 else model.zero_token_id
+                delay_padding[0, assistant_index, 0] if source < 0 else model.zero_token_id
             )
             user_index = codebook + model.user_audio_offset
             if 0 <= source < audio_codes.shape[-1]:
                 frame[:, user_index, 0] = audio_codes[:, codebook, source]
             elif source < 0:
-                frame[:, user_index, 0] = model.initial_token_id
+                frame[:, user_index, 0] = delay_padding[0, user_index, 0]
             else:
                 # Match the absent-audio tail used by online_streams in training.
                 frame[:, user_index, 0] = model.zero_token_id
@@ -205,6 +206,7 @@ def generate_assistant(
     frames = user_audio_codes.shape[-1]
     delayed_steps = frames + max(config.audio_delays)
     pattern = model._get_initial_token()
+    delay_padding = model.delay_padding()
     generated_text: list[int] = []
     delayed_assistant: list[torch.Tensor] = []
     text_finished = False
@@ -232,7 +234,7 @@ def generate_assistant(
         for codebook in range(config.num_codebooks):
             source = step - config.audio_delays[codebook]
             if source < 0:
-                assistant_tokens.append(model.initial_token_id)
+                assistant_tokens.append(int(delay_padding[0, model.audio_offset + codebook, 0]))
                 continue
             if source >= frames:
                 assistant_tokens.append(model.zero_token_id)
@@ -282,7 +284,7 @@ def generate_assistant(
             if 0 <= source < frames:
                 frame[:, user_index, 0] = user_audio_codes[:, codebook, source]
             elif source < 0:
-                frame[:, user_index, 0] = model.initial_token_id
+                frame[:, user_index, 0] = delay_padding[0, user_index, 0]
         pattern = torch.cat([pattern, frame], dim=-1)
 
         if (

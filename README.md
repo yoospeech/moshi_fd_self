@@ -59,21 +59,35 @@ tests/                     regression tests
 
 ## Natural Monologue sine conditioning
 
-Natural Monologue training can optionally add a sine-wave acoustic target where
-leading assistant BPE replaces a HEAR control token while the user is speaking
-and the assistant audio is still silent. It does not modify user audio,
-assistant speech, VAD, text placement, sequence lengths, Mimi delay, the model,
-or either loss. The feature is disabled by default.
-
-The frame condition is:
-
-    user VAD active AND assistant BPE active AND assistant VAD inactive
+With `--enable-sine-conditioning`, user speech pauses assistant content.
+Interrupted assistant text/audio frames are queued in order and resume when
+the user stops. Empty source frames are not queued; unused frames in both
+audio channels contain a sine wave. Pending content can extend the sample.
+The feature is disabled by default.
 
 The resulting raw frame layout remains
 `assistant_text | assistant_Mimi | user_Mimi`. Moshi's existing delay pattern
-is then applied to the two audio groups (`[0, 1, 1, 1]` per Mimi stream); the
+is then applied to the two audio groups (`[1, 1, 1, 1]` per Mimi stream); the
 control symbols live only in the assistant text stream and do not consume an
 audio codebook slot.
+
+Text stays at its source frame and audio is delayed one frame. Controls describe
+the delayed audio: HEAR for user speech, SPEAK for assistant speech, WAIT for
+neither. Lexical BPE takes precedence, including on the final delayed user frame.
+SPEAK below denotes the existing `<SPK>` tokenizer token. Example after delay:
+
+```text
+Frame:           [  0  |  1   |   2   |   3    |   4   |    5     |    6    |    7     |    8     |    9    |  10   |  11  ]
+User audio:      [sine | sine | sine  | "Wait" | "one" | "second" | sine    | sine     | sine     | sine    | sine  | sine ]
+Assistant audio: [sine | sine | "I"   | sine   | sine  | sine     | "think" | "we"     | "should" | "leave" | "now" | sine ]
+Text:            [WAIT | [I]  | SPEAK | HEAR   | HEAR  | [think]  | [we]    | [should] | [leave]  | [now]   | SPEAK | WAIT ]
+```
+
+This is a symbolic frame example. Real utterances use contiguous BPE starting
+at the annotated utterance onset, without word timestamps; individual spoken
+words need not occupy one frame or line up with their BPE piece boundaries.
+Initial delayed audio slots use Mimi-encoded sine IDs saved in the checkpoint;
+the model's internal BOS remains separate from the displayed timeline.
 
 Enable it with a VAD-driven natural manifest or a Behavior-SD folder containing
 adjacent same-stem WAV/JSON pairs. Training registers

@@ -45,6 +45,7 @@ class FullDuplexConfig:
     wait_token_id: int | None = None
     spk_token_id: int | None = None
     hear_token_id: int | None = None
+    sine_audio_token_ids: list[int] | None = None
 
     @property
     def text_delay_steps(self) -> int:
@@ -53,8 +54,7 @@ class FullDuplexConfig:
     @property
     def delays(self) -> list[int]:
         # Moshi ordering: assistant text, assistant audio, then user audio.
-        # Both Mimi streams use one semantic codebook followed by delayed
-        # acoustic codebooks.
+        # Every codebook of both audio streams receives the same delay.
         return [self.assistant_text_delay_steps] + self.audio_delays * 2
 
     @property
@@ -235,10 +235,13 @@ class MoshiFullDuplexModel(LMModel):
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
         initial = self._get_initial_token().expand(batch, -1, -1)
-        # Construct Moshi's V_s interleaving for training: text and semantic
-        # streams stay at s, while assistant/user acoustic streams move to
-        # s + acoustic_delay. Inference generates this same delayed timeline.
-        delayed = _delay_sequence(self.delays, streams, initial)
+        # The internal BOS prefix is separate from the audio delay fill.
+        # Sine-conditioned timelines use actual Mimi sine codes in empty slots.
+        padding = self.delay_padding(batch)
+        if self.full_duplex_config.sine_audio_token_ids is not None:
+            text_only = (streams[:, self.audio_offset:] == self.zero_token_id).all(dim=(1, 2))
+            padding[text_only, self.audio_offset:] = self.zero_token_id
+        delayed = _delay_sequence(self.delays, streams, padding)
         delayed = torch.cat([initial, delayed], dim=2)
         temporal, text_logits = self.forward_text(delayed[:, :, :-1])
         text_logits, text_mask = _undelay_sequence(
@@ -258,6 +261,17 @@ class MoshiFullDuplexModel(LMModel):
             :, self.audio_offset : self.user_audio_offset
         ] != self.zero_token_id
         return text_logits, text_mask, audio_logits, audio_mask
+
+    def delay_padding(self, batch: int = 1) -> torch.Tensor:
+        padding = self._get_initial_token().expand(batch, -1, -1).clone()
+        sine = self.full_duplex_config.sine_audio_token_ids
+        if sine is not None:
+            if len(sine) != self.full_duplex_config.num_codebooks:
+                raise ValueError("sine_audio_token_ids must contain one ID per codebook")
+            codes = torch.tensor(sine, dtype=padding.dtype, device=padding.device)
+            padding[:, self.audio_offset:self.user_audio_offset, 0] = codes
+            padding[:, self.user_audio_offset:, 0] = codes
+        return padding
 
 
 def masked_multistream_loss(

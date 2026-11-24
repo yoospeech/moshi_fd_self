@@ -4,6 +4,7 @@ import json
 import math
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from full_duplex.natural_monologue_dataset import (
     create_natural_monologue_dataloader,
     discover_behavior_sd_entries,
 )
+from full_duplex.model import FullDuplexConfig, MoshiFullDuplexModel, _delay_sequence
 
 
 class Tokenizer:
@@ -35,6 +37,57 @@ class Tokenizer:
 
 
 class NaturalMonologueDatasetTests(unittest.TestCase):
+    def test_agreed_twelve_frame_interleaving(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(Path(directory), enable_sine_conditioning=True)
+            dataset.tokenizer = SimpleNamespace(encode=lambda *a, **kw: [21, 22, 23, 24, 25, 26])
+            entry = {"path": "example.wav", "monologues": [{"text": "I think we should leave now", "start": 0.1}]}
+            text, dense, schedule, user_active = dataset._text_stream(
+                entry, 12, [(0.2, 0.5)], [(0.1, 0.7)]
+            )
+            self.assertEqual(dense.tolist(), [21, 22, 23, 24, 25, 26])
+            # Distinct symbolic codec IDs represent each audible word.
+            raw_assistant = torch.tensor([90, 21, 22, 23, 24, 25, 26, 90, 90, 90, 90, 90])
+            assistant = torch.tensor([90 if i < 0 else raw_assistant[i] for i in schedule.tolist()])
+            user = torch.tensor([90, 90, 31, 32, 33, 90, 90, 90, 90, 90, 90, 90])
+            cfg = FullDuplexConfig(num_codebooks=1, sine_audio_token_ids=[90])
+            stub = SimpleNamespace(
+                full_duplex_config=cfg, audio_offset=1, user_audio_offset=2,
+                _get_initial_token=lambda: torch.full((1, 3, 1), 99),
+            )
+            padding = MoshiFullDuplexModel.delay_padding(stub)
+            delayed = _delay_sequence(cfg.delays, torch.stack([text, assistant, user])[None], padding)[0]
+            self.assertEqual(delayed[0].tolist(), [10, 21, 11, 12, 12, 22, 23, 24, 25, 26, 11, 10])
+            self.assertEqual(delayed[1].tolist(), [90, 90, 21, 90, 90, 90, 22, 23, 24, 25, 26, 90])
+            self.assertEqual(delayed[2].tolist(), [90, 90, 90, 31, 32, 33, 90, 90, 90, 90, 90, 90])
+            # Exercise waveform rendering too: source frames are moved intact.
+            waveform = raw_assistant.float().repeat_interleave(10)
+            rendered = dataset._apply_sine_conditioning(waveform, schedule).view(12, 10)
+            for frame in (1, 5, 6, 7, 8, 9):
+                torch.testing.assert_close(rendered[frame], waveform.view(12, 10)[schedule[frame]])
+            self.assertEqual(user_active.nonzero().flatten().tolist(), [2, 3, 4])
+
+    def test_user_only_turn_does_not_shift_future_assistant_onset(self):
+        user = torch.tensor([True, True, False, False, False, False])
+        assistant = torch.tensor([False, False, False, False, True, False])
+        self.assertEqual(NaturalMonologueDataset._interleave_schedule(user, assistant), [None, None, None, None, 4, None])
+
+    def test_repeated_interruptions_preserve_all_assistant_frames(self):
+        user = torch.tensor([False, True, True, False, True, False])
+        assistant = torch.tensor([True, True, True, True, False, True])
+        self.assertEqual(
+            NaturalMonologueDataset._interleave_schedule(user, assistant),
+            [0, None, None, 1, None, 2, 3, 5],
+        )
+
+    def test_user_tail_is_flushed_before_final_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(Path(directory), texts=[{"text": "짧게", "start": 0.1}], enable_sine_conditioning=True)
+            text, _, schedule, user = dataset._text_stream(dataset.entries[0], 10, [(0.8, 1.0)], [(0.1, 0.2)])
+            self.assertEqual(text[-4:].tolist(), [10, 12, 12, 10])
+            self.assertEqual(len(schedule), 12)
+            self.assertEqual(user.nonzero().flatten().tolist(), [8, 9])
+
     def test_behavior_text_cleaner_preserves_speech_and_removes_markup(self):
         self.assertEqual(
             clean_behavior_text("<laughter>yeah</laughter>, [Oh, really?]"),
@@ -225,31 +278,30 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                                                0.6000000000000001, 10)
             self.assertEqual(list(interval), [3, 4, 5])
 
-    def test_sine_mask_covers_only_hear_overwritten_by_bpe_during_silence(self):
+    def test_user_speech_pauses_text_under_sine_then_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = self._dataset(
                 Path(directory), enable_sine_conditioning=True
             )
             entry = dataset.entries[0]
-            text, _dense, sine_mask = dataset._text_stream(
+            text, _dense, schedule, user_active = dataset._text_stream(
                 entry,
                 frame_length=10,
                 user_intervals=[(0.0, 0.5)],
                 assistant_intervals=[(0.3, 0.6)],
             )
-            self.assertEqual(text.tolist(), [12, 1, 2, 3, 4, 11, 10, 10, 10, 10])
-            # Frames 1-2: HEAR overwritten by BPE while assistant is silent.
             self.assertEqual(
-                sine_mask.tolist(),
-                [False, True, True, False, False, False, False, False, False, False],
+                text.tolist(),
+                [10, 12, 12, 12, 12, 1, 2, 3, 4, 11, 11, 10],
             )
-            # BPE+assistant speech, HEAR-only, WAIT and SPK are all excluded.
-            self.assertFalse(sine_mask[3])
-            self.assertFalse(sine_mask[4])
-            self.assertFalse(sine_mask[5])
-            self.assertFalse(sine_mask[6:].any())
+            self.assertEqual(
+                schedule.tolist(),
+                [-1, -1, -1, -1, -1, -1, -1, 3, 4, 5, -1, -1],
+            )
+            self.assertEqual(text[5:9].tolist(), [1, 2, 3, 4])
+            self.assertEqual(user_active.tolist(), [True] * 5 + [False] * 7)
 
-    def test_sine_is_inserted_without_changing_user_or_lengths(self):
+    def test_sine_pauses_audio_and_marks_user_silence(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = self._dataset(
                 Path(directory), enable_sine_conditioning=True
@@ -264,21 +316,24 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 side_effect=[[(0.0, 0.5)], [(0.3, 0.6)]],
             ):
                 item = dataset[0]
+            self.assertEqual(item["waveform"].numel(), 120)
+            self.assertEqual(item["assistant_waveform"].numel(), 120)
+            self.assertEqual(item["assistant_text_tokens"].numel(), 12)
+            # User speech is preserved for five frames; every no-user frame,
+            # including the extended tail, is represented by sine.
+            torch.testing.assert_close(item["waveform"][:50], torch.full((50,), -0.5))
+            self.assertFalse((item["waveform"][50:] == 0).all())
+            # Only real assistant audio is resumed; original inactive frames
+            # become sine, including lexical-only frames preceding speech.
             torch.testing.assert_close(
-                item["waveform"], torch.full((95,), -0.5)
+                item["assistant_waveform"][70:100],
+                item["original_assistant_waveform"][30:60],
             )
-            self.assertEqual(item["assistant_waveform"].numel(), 95)
-            self.assertEqual(item["assistant_text_tokens"].numel(), 10)
-            # Selected frames changed, actual assistant speech and incomplete
-            # final frame remain bit-identical to the source.
-            self.assertFalse(torch.equal(
-                item["assistant_waveform"][:30],
-                item["original_assistant_waveform"][:30],
-            ))
-            torch.testing.assert_close(
-                item["assistant_waveform"][30:],
-                item["original_assistant_waveform"][30:],
+            sine = dataset.sine_amplitude * torch.sin(
+                2 * math.pi * dataset.sine_frequency * torch.arange(120) / 100
             )
+            torch.testing.assert_close(item["assistant_waveform"][:70], sine[:70], atol=2e-4, rtol=1e-4)
+            torch.testing.assert_close(item["assistant_waveform"][100:], sine[100:], atol=2e-4, rtol=1e-4)
 
     def test_disabled_conditioning_is_bit_identical(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -301,15 +356,15 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
             self.assertNotIn("sine_frames", item)
             self.assertNotIn("sine_duration", item)
 
-    def test_user_silence_produces_no_sine_for_bpe(self):
+    def test_inactive_assistant_audio_is_sine_even_with_bpe(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = self._dataset(
                 Path(directory), enable_sine_conditioning=True
             )
-            _text, _dense, sine_mask = dataset._text_stream(
+            _text, _dense, schedule, _user = dataset._text_stream(
                 dataset.entries[0], 10, [], [(0.3, 0.6)]
             )
-            self.assertFalse(sine_mask.any())
+            self.assertEqual(schedule.tolist(), [-1, -1, -1, 3, 4, 5, -1, -1, -1, -1])
 
     def test_multiple_monologues_use_annotated_onset_frames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -321,13 +376,12 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 ],
                 enable_sine_conditioning=True,
             )
-            text, dense, sine_mask = dataset._text_stream(
+            text, dense, schedule, _user = dataset._text_stream(
                 dataset.entries[0], 10, [(0.0, 0.8)], [(0.1, 0.2), (0.6, 0.7)]
             )
             self.assertEqual(dense.tolist(), [7, 7])
-            self.assertEqual(text[1].item(), 7)
-            self.assertEqual(text[6].item(), 7)
-            self.assertFalse(sine_mask.any())  # Both BPE frames contain assistant speech.
+            self.assertEqual(text.tolist(), [10] + [12] * 7 + [7, 7, 11, 10])
+            self.assertEqual(schedule.tolist(), [-1] * 8 + [1, 6, -1, -1])
 
     def test_behavior_sd_text_uses_exact_annotated_audio_frames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -347,7 +401,7 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 manifest, Tokenizer(), wait_token_id=10, spk_token_id=11,
                 hear_token_id=12, frame_rate=12.5, min_text_tokens=0,
             )
-            text, _dense, _sine = dataset._text_stream(
+            text, _dense, _schedule, _user = dataset._text_stream(
                 dataset.entries[0], 388, [], []
             )
             first_frame = math.floor(23.49968253968254 * 12.5)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -201,6 +202,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         enable_sine_conditioning: bool = False,
         sine_frequency: float = 440.0,
         sine_amplitude: float = 0.5,
+        audio_delay_steps: int = 1,
         folders: str | None = None,
         max_files: int = 0,
     ) -> None:
@@ -223,6 +225,9 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         self.enable_sine_conditioning = bool(enable_sine_conditioning)
         self.sine_frequency = float(sine_frequency)
         self.sine_amplitude = float(sine_amplitude)
+        self.audio_delay_steps = int(audio_delay_steps)
+        if self.audio_delay_steps < 0:
+            raise ValueError("audio_delay_steps must be nonnegative")
 
         if len({self.wait_token_id, self.spk_token_id, self.hear_token_id}) != 3:
             raise ValueError("WAIT, SPK, and HEAR token IDs must be distinct")
@@ -383,7 +388,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         frame_length: int,
         user_intervals: list[tuple[float, float]],
         assistant_intervals: list[tuple[float, float]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         user_active = torch.zeros(frame_length, dtype=torch.bool)
         assistant_active = torch.zeros(frame_length, dtype=torch.bool)
         for target, intervals in (
@@ -394,11 +399,9 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 interval = self._frame_interval(start, end, frame_length)
                 target[interval.start:interval.stop] = True
 
-        # HEAR wins during overlap because assistant activity is already
-        # represented by the assistant audio stream.
+        # Build the source timeline before the model delays both audio streams.
         stream = torch.full((frame_length,), self.wait_token_id, dtype=torch.long)
         stream[assistant_active] = self.spk_token_id
-        stream[user_active] = self.hear_token_id
         lexical = torch.zeros(frame_length, dtype=torch.bool)
         dense_text: list[int] = []
         for monologue_index, item in enumerate(entry["monologues"]):
@@ -438,35 +441,137 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 )
             stream[start:required] = torch.tensor(pieces, dtype=torch.long)
             lexical[start:required] = True
-        # Only original audio frames can condition Mimi. Lexical text may extend
-        # past the audio timeline, so never extend the acoustic mask with it.
-        sine_mask = user_active & lexical[:frame_length] & ~assistant_active
-        return stream, torch.tensor(dense_text, dtype=torch.long), sine_mask
+        if self.enable_sine_conditioning:
+            assistant_content = assistant_active | lexical[:frame_length]
+            schedule = self._interleave_schedule(user_active, assistant_content)
+            last_content = max(
+                (i for i, source in enumerate(schedule) if source is not None),
+                default=-1,
+            )
+            last_user = int(user_active.nonzero()[-1]) if user_active.any() else -1
+            # Keep the delayed audio tail and a final WAIT in the text timeline.
+            required = max(len(schedule), max(last_content, last_user) + self.audio_delay_steps + 2)
+            schedule.extend([None] * (required - len(schedule)))
+            interleaved = torch.full(
+                (len(schedule),), self.wait_token_id, dtype=torch.long
+            )
+            output_user_active = torch.zeros(len(schedule), dtype=torch.bool)
+            output_user_active[:frame_length] = user_active
+            assistant_schedule = torch.full((len(schedule),), -1, dtype=torch.long)
+            for output_frame, source_frame in enumerate(schedule):
+                if source_frame is not None and assistant_active[source_frame]:
+                    assistant_schedule[output_frame] = source_frame
+            # Controls describe the audible (delayed) frame. Lexical tokens
+            # announce the next audio frame and take precedence over controls.
+            for output_frame, source_frame in enumerate(schedule):
+                audible_source = output_frame - self.audio_delay_steps
+                if audible_source >= 0:
+                    if output_user_active[audible_source]:
+                        interleaved[output_frame] = self.hear_token_id
+                    elif assistant_schedule[audible_source] >= 0:
+                        interleaved[output_frame] = self.spk_token_id
+                if source_frame is not None and lexical[source_frame]:
+                    interleaved[output_frame] = stream[source_frame]
+            stream = interleaved
+        else:
+            # Without pause/resume conditioning, retain the original aligned
+            # behavior: lexical pieces take precedence over HEAR.
+            lexical_tokens = stream[lexical].clone()
+            stream[:frame_length][user_active] = self.hear_token_id
+            stream[lexical] = lexical_tokens
+            assistant_schedule = torch.arange(frame_length, dtype=torch.long)
+            output_user_active = user_active
+        return (
+            stream,
+            torch.tensor(dense_text, dtype=torch.long),
+            assistant_schedule,
+            output_user_active,
+        )
+
+    @staticmethod
+    def _interleave_schedule(
+        user_active: torch.Tensor, assistant_content: torch.Tensor
+    ) -> list[int | None]:
+        """Queue only assistant content interrupted by user speech.
+
+        Empty source frames are represented by sine and are never queued. This
+        preserves the absolute timeline until a real overlap occurs, then drains
+        interrupted assistant frames in order without losing content.
+        """
+        schedule: list[int | None] = []
+        queued: deque[int] = deque()
+        for source_frame in range(user_active.numel()):
+            has_content = bool(assistant_content[source_frame])
+            if bool(user_active[source_frame]):
+                if has_content:
+                    queued.append(source_frame)
+                schedule.append(None)
+            elif queued:
+                output = queued.popleft()
+                if has_content:
+                    queued.append(source_frame)
+                schedule.append(output)
+            elif has_content:
+                schedule.append(source_frame)
+            else:
+                schedule.append(None)
+        schedule.extend(queued)
+        return schedule
 
     def _apply_sine_conditioning(
-        self, assistant: torch.Tensor, sine_mask: torch.Tensor
+        self, assistant: torch.Tensor, assistant_schedule: torch.Tensor
     ) -> torch.Tensor:
-        """Replace only selected assistant-silence samples with a sine wave."""
-        if not self.enable_sine_conditioning or not sine_mask.any():
+        """Render scheduled assistant content and sine in every empty frame."""
+        if not self.enable_sine_conditioning:
             return assistant
         samples_per_frame = int(self.sample_rate / self.frame_rate)
         if samples_per_frame < 1:
             raise ValueError("frame_rate cannot exceed sample_rate")
-        sample_mask = sine_mask.repeat_interleave(samples_per_frame)
-        if sample_mask.numel() < assistant.numel():
-            sample_mask = torch.nn.functional.pad(
-                sample_mask, (0, assistant.numel() - sample_mask.numel()), value=False
-            )
-        sample_mask = sample_mask[:assistant.numel()].to(device=assistant.device)
+        source_frames = math.ceil(assistant.numel() / samples_per_frame)
+        padded_samples = source_frames * samples_per_frame
+        source = torch.nn.functional.pad(
+            assistant[:padded_samples],
+            (0, max(0, padded_samples - assistant.numel())),
+        )
+        source = source.view(source_frames, samples_per_frame)
+        conditioned = assistant.new_empty(assistant_schedule.numel(), samples_per_frame)
         time = torch.arange(
-            assistant.numel(), dtype=torch.float32, device=assistant.device
+            conditioned.numel(), dtype=torch.float32, device=assistant.device
         ) / self.sample_rate
         sine = self.sine_amplitude * torch.sin(
             2 * math.pi * self.sine_frequency * time
+        ).view_as(conditioned).to(dtype=conditioned.dtype)
+        for output_frame, source_frame in enumerate(assistant_schedule.tolist()):
+            if source_frame < 0:
+                conditioned[output_frame] = sine[output_frame]
+            else:
+                conditioned[output_frame] = source[source_frame]
+                valid_samples = min(samples_per_frame, assistant.numel() - source_frame * samples_per_frame)
+                conditioned[output_frame, valid_samples:] = sine[output_frame, valid_samples:]
+        return conditioned.flatten()
+
+    def _apply_user_sine(
+        self, user: torch.Tensor, user_active: torch.Tensor
+    ) -> torch.Tensor:
+        """Keep real user speech and represent every no-user frame with sine."""
+        if not self.enable_sine_conditioning:
+            return user
+        samples_per_frame = int(self.sample_rate / self.frame_rate)
+        if samples_per_frame < 1:
+            raise ValueError("frame_rate cannot exceed sample_rate")
+        output_samples = user_active.numel() * samples_per_frame
+        padded = torch.nn.functional.pad(
+            user[:output_samples], (0, max(0, output_samples - user.numel()))
         )
-        conditioned = assistant.clone()
-        conditioned[sample_mask] = sine.to(dtype=conditioned.dtype)[sample_mask]
-        return conditioned
+        time = torch.arange(
+            output_samples, dtype=torch.float32, device=user.device
+        ) / self.sample_rate
+        sine = self.sine_amplitude * torch.sin(
+            2 * math.pi * self.sine_frequency * time
+        ).to(dtype=user.dtype)
+        sample_active = user_active.repeat_interleave(samples_per_frame).to(user.device)
+        sample_active &= torch.arange(output_samples, device=user.device) < user.numel()
+        return torch.where(sample_active, padded, sine)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         entry = self.entries[index]
@@ -492,11 +597,14 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         )
         user_intervals = self._vad_intervals(user)
         assistant_intervals = self._vad_intervals(assistant)
-        text, dense_text, sine_mask = self._text_stream(
+        text, dense_text, assistant_schedule, output_user_active = self._text_stream(
             entry, frame_length, user_intervals, assistant_intervals
         )
         original_assistant = assistant
-        assistant = self._apply_sine_conditioning(assistant, sine_mask)
+        assistant = self._apply_sine_conditioning(assistant, assistant_schedule)
+        user = self._apply_user_sine(user, output_user_active)
+        if self.enable_sine_conditioning:
+            frame_length = text.numel()
         result = {
             "id": str(entry.get("id", audio_path.stem)),
             "language": str(entry.get("language", "unknown")),
@@ -513,9 +621,9 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         if self.enable_sine_conditioning:
             result.update(
                 original_assistant_waveform=original_assistant,
-                sine_mask=sine_mask,
-                sine_frames=int(sine_mask.sum()),
-                sine_duration=float(sine_mask.sum()) / self.frame_rate,
+                sine_mask=assistant_schedule.lt(0),
+                sine_frames=int(assistant_schedule.lt(0).sum()),
+                sine_duration=float(assistant_schedule.lt(0).sum()) / self.frame_rate,
             )
         return result
 
@@ -606,7 +714,7 @@ def write_natural_monologue_debug(
     frame_time = torch.arange(frame_length) / dataset.frame_rate
     panels = (
         ("User waveform", time, user),
-        ("Original assistant", time, original),
+        ("Original assistant", torch.arange(original.numel()) / dataset.sample_rate, original),
         ("Modified assistant", time, modified),
         ("User VAD", frame_time, user_mask),
         ("Assistant VAD", frame_time, assistant_mask),

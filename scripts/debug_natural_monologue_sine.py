@@ -106,9 +106,11 @@ def main() -> None:
             mimi = moshi_loaders.get_mimi(
                 args.mimi_checkpoint, device="cpu", num_codebooks=args.num_codebooks
             )
+            original = item["original_assistant_waveform"]
+            modified = item["assistant_waveform"]
             pair = torch.stack([
-                item["original_assistant_waveform"],
-                item["assistant_waveform"],
+                torch.nn.functional.pad(original, (0, modified.numel() - original.numel())),
+                modified,
             ])[:, None]
             with torch.inference_mode():
                 codes = mimi.encode(pair)

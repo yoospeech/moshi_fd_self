@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hear-token-id", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
         "--enable-sine-conditioning", action="store_true",
-        help="replace assistant silence with sine only where user speech and leading BPE overlap",
+        help="pause/resume assistant content during user speech and fill inactive audio with sine",
     )
     parser.add_argument("--sine-frequency", type=float, default=440.0)
     parser.add_argument("--sine-amplitude", type=float, default=0.5)
@@ -653,6 +653,16 @@ def run_training() -> None:
         mimi.eval()
         for parameter in mimi.parameters():
             parameter.requires_grad_(False)
+        if args.enable_sine_conditioning:
+            if config.assistant_text_delay_steps != 0:
+                raise ValueError("sine conditioning requires --assistant-text-delay-steps 0")
+            with torch.no_grad():
+                samples = int(mimi.sample_rate / config.frame_rate)
+                time_axis = torch.arange(samples, device=mimi_device) / mimi.sample_rate
+                sine = args.sine_amplitude * torch.sin(
+                    2 * torch.pi * args.sine_frequency * time_axis
+                )
+                config.sine_audio_token_ids = mimi.encode(sine[None, None])[0, :, 0].tolist()
         mimi_seconds = time.perf_counter() - mimi_start
 
     if primary:
@@ -795,6 +805,7 @@ def run_training() -> None:
                     enable_sine_conditioning=args.enable_sine_conditioning,
                     sine_frequency=args.sine_frequency,
                     sine_amplitude=args.sine_amplitude,
+                    audio_delay_steps=config.acoustic_delay_steps,
                     folders=args.folders,
                     max_files=args.max_files,
                 )

@@ -233,11 +233,23 @@ class ModelTests(unittest.TestCase):
                 text_padding_id=32, text_epad_id=33, audio_card=16,
                 depformer_dim=32, depformer_heads=4, depformer_layers=2,
                 depformer_ffn_dim=64,
+                sine_audio_token_ids=[1, 2, 3, 4],
             )
             model = MoshiFullDuplexModel(cfg, device="cpu", dtype=torch.float32)
             model.eval()
+            torch.testing.assert_close(
+                model.delay_padding()[0, 1:, 0], torch.tensor([1, 2, 3, 4] * 2)
+            )
+            self.assertEqual(model.checkpoint_metadata()["sine_audio_token_ids"], [1, 2, 3, 4])
             self.assertEqual(cfg.delays, [0, 1, 1, 1, 1, 1, 1, 1, 1])
             causal_probe = torch.randint(0, 16, (1, 9, 12))
+            with patch.object(model, "forward_text", wraps=model.forward_text) as recorded:
+                model.forward_training(causal_probe, predict_audio=False)
+                torch.testing.assert_close(recorded.call_args.args[0][0, 1:, 1], torch.tensor([1, 2, 3, 4] * 2))
+                text_only = causal_probe.clone()
+                text_only[:, 1:] = -1
+                model.forward_training(text_only, predict_audio=False)
+                self.assertTrue((recorded.call_args.args[0][0, 1:, 1] == -1).all())
             with torch.no_grad():
                 reference = model.forward_training(
                     causal_probe, predict_audio=False

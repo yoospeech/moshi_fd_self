@@ -648,8 +648,9 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
                 # timestamps and out-of-range words in the middle of a sample.
                 is_last = position == len(parsed) - 1
                 if is_last and end <= duration + 0.1:
-                    start = min(start, duration)
+                    word_duration = end - start
                     end = duration
+                    start = max(0.0, end - word_duration)
                 else:
                     raise ValueError(
                         f"alignment[{index}] word={word!r} has invalid timestamp "

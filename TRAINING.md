@@ -88,7 +88,7 @@ Skipped online samples report their failure stage and original error. The stages
 are `transcription_failed`, `empty_alignment`, `timestamp_validation_failed`,
 and `text_tokens_failed`. CUDA out-of-memory errors remain fatal rather than
 being treated as invalid samples. A final word ending no more than 100 ms past
-the WAV boundary is clamped to the actual duration; larger overruns and
+the WAV boundary is shifted left to preserve its duration; larger overruns and
 out-of-range words before the final word are rejected.
 
 Folder language labels are passed to Whisper and returned in
@@ -156,6 +156,22 @@ loads its own Whisper model on the same GPU as its backbone and Mimi. Use a
 smaller batch or CPU alignment if those three models do not fit together.
 
 ## Losses and metrics
+
+### Resume stereo training
+
+Add `--resume runs/stereo_ddp/checkpoint_00000500.pt` to the original training
+command. `--steps 1000` means a total target of 1000 batches, not 1000 additional
+batches. Model configuration, weights and optimizer state (including learning
+rates) come from the checkpoint. Keep the original task, folders and filtering
+options. New checkpoints restore epoch, next batch, rank-local Torch RNG,
+cached online alignments and invalid-sample indices. World size, batch size,
+gradient accumulation, seed and discovered training data must match.
+
+Checkpoints are written only after optimizer updates; a save interval falling
+inside gradient accumulation is deferred to the next update. Older checkpoints
+without training progress restore weights/optimizer/step but restart data at
+epoch zero. This is not a guarantee of bit-identical GPU execution or future
+Whisper outputs. Checkpoint files should be trusted local files.
 
 | Option | Default | Meaning |
 |---|---:|---|

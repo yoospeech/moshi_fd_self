@@ -39,6 +39,14 @@ MODEL_REPOSITORIES = {
 }
 
 
+class ResumableDistributedSampler(DistributedSampler):
+    """Skip completed samples before the DataLoader reads or transcribes them."""
+    start_index = 0
+
+    def __iter__(self):
+        return iter(list(super().__iter__())[self.start_index:])
+
+
 class SkipInvalidDataset(Dataset):
     """Keep lazy mono failures from terminating an otherwise valid epoch.
 
@@ -107,6 +115,8 @@ def resolve_model_source(model: str, download_root: str) -> tuple[Path, str | No
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
+    parser.add_argument("--resume", type=Path,
+                        help="resume model, optimizer and step from a local checkpoint; steps is the total target")
     parser.add_argument("--alignment-mode", choices=("online", "sidecar"), default="online",
                         help="extract missing word alignments lazily while loading folder samples")
     parser.add_argument("--alignment-model", default="medium")
@@ -216,6 +226,7 @@ def save_checkpoint(
     optimizers: dict[str, torch.optim.Optimizer],
     step: int,
     output: Path,
+    training_state: dict | None = None,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -223,6 +234,8 @@ def save_checkpoint(
             "model": model.state_dict(),
             "optimizers": {name: optimizer.state_dict() for name, optimizer in optimizers.items()},
             "step": step,
+            "config": model.checkpoint_metadata(),
+            "training_state": training_state,
         },
         output / f"checkpoint_{step:08d}.pt",
     )
@@ -470,6 +483,20 @@ def main() -> None:
 def run_training() -> None:
     startup_start = time.perf_counter()
     args = parse_args()
+    resume_state = None
+    resume_config = None
+    if args.resume is not None:
+        resume_state = torch.load(args.resume, map_location="cpu", weights_only=True)
+        metadata = resume_state.get("config")
+        if metadata is None:
+            metadata = json.loads(args.resume.with_name("config.json").read_text())
+        resume_config = FullDuplexConfig(**metadata)
+        args.model = resume_config.temporal_model
+        args.trust_remote_code = resume_config.trust_remote_code
+        if int(resume_state["step"]) >= args.steps:
+            raise ValueError("--steps must exceed the checkpoint step (total target, not additional steps)")
+        if args.smoke_test:
+            raise ValueError("--resume cannot be combined with --smoke-test")
     if not 0.0 <= args.text_only_fraction <= 1.0:
         raise ValueError("text-only-fraction must be between 0 and 1")
     if not 0.0 <= args.audio_text_mask_probability <= 1.0:
@@ -531,7 +558,13 @@ def run_training() -> None:
         text_padding_weight=args.text_padding_weight,
     )
     model_start = time.perf_counter()
+    if resume_config is not None:
+        config = resume_config
+        if config.text_card != base_text_card + 2:
+            raise ValueError("checkpoint tokenizer vocabulary differs from the loaded tokenizer")
     model = MoshiFullDuplexModel(config, dtype=dtype, device=device)
+    if resume_state is not None:
+        model.load_state_dict(resume_state["model"], strict=True)
     if args.disable_lfm3_triton:
         temporal_module = importlib.import_module(model.transformer.__class__.__module__)
         if not hasattr(temporal_module, "can_use_lfm3_conv"):
@@ -616,6 +649,11 @@ def run_training() -> None:
 
     optimizers = {"mixed": make_optimizer()}
     optimizer = optimizers["mixed"]
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizers"]["mixed"])
+        if primary:
+            print(f"resuming {args.resume} at step={resume_state['step']}; "
+                  "model config and optimizer LR restored", flush=True)
 
     if args.smoke_test:
         # Valid DSM controls plus random Mimi codes. This checks the complete
@@ -746,10 +784,10 @@ def run_training() -> None:
         if world_size > 1:
             if train_size < world_size:
                 raise ValueError("training split must contain at least one sample per rank")
-            train_sampler = DistributedSampler(
-                train_dataset, num_replicas=world_size, rank=rank,
-                seed=args.seed, shuffle=True, drop_last=True,
-            )
+        train_sampler = ResumableDistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank,
+            seed=args.seed, shuffle=True, drop_last=world_size > 1,
+        )
         loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
@@ -775,15 +813,65 @@ def run_training() -> None:
         target_steps = args.steps
 
     optimizer.zero_grad(set_to_none=True)
-    step = 0
+    step = int(resume_state["step"]) if resume_state is not None else 0
+    resume_step = step
+    saved_progress = resume_state.get("training_state") if resume_state is not None else None
     epoch = 0
+    resume_batch = 0
+    if saved_progress:
+        expected = {"world_size": world_size, "batch_size": args.batch_size,
+                    "grad_accum": args.grad_accum, "seed": args.seed,
+                    "train_indices": train_dataset.dataset.indices if lazy_folder_alignment else train_dataset.indices,
+                    "paths": [entry["path"] for entry in dataset.entries]}
+        for key, value in expected.items():
+            if saved_progress[key] != value:
+                raise ValueError(f"resume requires unchanged {key}")
+        epoch = saved_progress["epoch"]
+        resume_batch = saved_progress["next_batch"]
+        if lazy_folder_alignment:
+            local = saved_progress["rng"][rank]
+            for index, alignments in local.get("alignments", []):
+                dataset.entries[index]["alignments"] = alignments
+            train_dataset.invalid_indices = set(local.get("train_invalid", []))
+            valid_dataset.invalid_indices = set(local.get("valid_invalid", []))
+    elif args.resume is not None and primary:
+        print("legacy checkpoint has no batch/RNG state; restarting data at epoch 0", flush=True)
+    del resume_state
+    def checkpoint_progress(next_batch):
+        local = {"cpu_rng": torch.get_rng_state(),
+                 "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
+        if lazy_folder_alignment:
+            local.update(
+                alignments=[(i, e["alignments"]) for i, e in enumerate(dataset.entries)
+                            if e.get("alignments") is not None],
+                train_invalid=sorted(train_dataset.invalid_indices),
+                valid_invalid=sorted(valid_dataset.invalid_indices),
+            )
+        states = [None] * world_size
+        if world_size > 1:
+            dist.all_gather_object(states, local)
+        else:
+            states[0] = local
+        return {"epoch": epoch, "next_batch": next_batch,
+                "world_size": world_size, "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum, "seed": args.seed,
+                "train_indices": train_dataset.dataset.indices if lazy_folder_alignment else train_dataset.indices,
+                "paths": [entry["path"] for entry in dataset.entries], "rng": states}
     timing_totals = {"data": 0.0, "mimi": 0.0, "train": 0.0, "step": 0.0}
     timing_steps = 0
     previous_step_end = time.perf_counter()
     while step < target_steps:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        for batch in batches:
+            train_sampler.start_index = resume_batch * args.batch_size
+        for batch_index, batch in enumerate(batches, start=resume_batch):
+            if saved_progress:
+                rng = saved_progress["rng"][rank]
+                torch.set_rng_state(rng["cpu_rng"])
+                if rng["cuda_rng"] is not None:
+                    torch.cuda.set_rng_state(rng["cuda_rng"], device)
+                saved_progress = None
+            resume_batch = 0
             step_start = time.perf_counter()
             data_seconds = step_start - previous_step_end
             mimi_start = time.perf_counter()
@@ -820,8 +908,9 @@ def run_training() -> None:
                 if device.type == "cuda"
                 else contextlib.nullcontext()
             )
-            sync = (step + 1) % args.grad_accum == 0 or step + 1 == target_steps
-            accumulation_size = min(args.grad_accum, target_steps - (step // args.grad_accum) * args.grad_accum)
+            relative_step = step - resume_step
+            sync = (relative_step + 1) % args.grad_accum == 0 or step + 1 == target_steps
+            accumulation_size = min(args.grad_accum, target_steps - resume_step - (relative_step // args.grad_accum) * args.grad_accum)
             sync_context = objective.no_sync() if world_size > 1 and not sync else contextlib.nullcontext()
             with sync_context:
                 with autocast:
@@ -887,8 +976,8 @@ def run_training() -> None:
                         f"total={timing_totals['step']/timing_steps:.3f}s",
                         flush=True,
                     )
-            if primary and not args.smoke_test and step % args.save_every == 0:
-                save_checkpoint(model, optimizers, step, Path(args.output))
+            # Save only after optimizer updates: pending gradients are not serialized.
+            save_due = step // args.save_every > (step - (relative_step % args.grad_accum + 1)) // args.save_every
             validate = valid_loader is not None and step % args.valid_every == 0
             if validate:
                 barrier()
@@ -923,14 +1012,17 @@ def run_training() -> None:
                 )
             if validate:
                 barrier()
+            if not args.smoke_test and sync and (save_due or step >= target_steps):
+                progress = checkpoint_progress(batch_index + 1)
+                if primary:
+                    save_checkpoint(model, optimizers, step, Path(args.output), progress)
             if step >= target_steps:
                 break
             previous_step_end = time.perf_counter()
         epoch += 1
+        resume_batch = 0
 
     barrier()
-    if primary and not args.smoke_test:
-        save_checkpoint(model, optimizers, step, Path(args.output))
     if args.smoke_test and world_size > 1:
         for parameter in model.parameters():
             reference = parameter.detach().clone()

@@ -14,7 +14,7 @@ from full_duplex.dataset import (
     RecoverableSampleError,
     collate_duplex,
 )
-from full_duplex.train import SkipInvalidDataset
+from full_duplex.train import SkipInvalidDataset, ResumableDistributedSampler
 
 
 class Tokenizer:
@@ -23,6 +23,17 @@ class Tokenizer:
 
 
 class MonoPipelineTests(unittest.TestCase):
+    def test_resume_sampler_preserves_rank_order_without_loading_prefix(self):
+        for rank in range(2):
+            sampler = ResumableDistributedSampler(list(range(20)), num_replicas=2,
+                                                  rank=rank, seed=42, shuffle=True)
+            sampler.set_epoch(3)
+            original = list(sampler)
+            sampler.start_index = 4
+            self.assertEqual(list(sampler), original[4:])
+            sampler.start_index = len(original)
+            self.assertEqual(list(sampler), [])
+
     def test_stereo_folder_uses_native_user_and_assistant_channels(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -113,7 +124,10 @@ class MonoPipelineTests(unittest.TestCase):
     def test_small_final_timestamp_overrun_is_clamped(self):
         alignments = [['hello', [1, 2], 'S'], ['call.', [100.27, 100.29], 'S']]
         validated = MonoPostTrainingDataset._validate_alignments(alignments, 100.23319)
-        self.assertEqual(validated[-1], ['call.', [100.23319, 100.23319], 'S'])
+        word, (start, end), speaker = validated[-1]
+        self.assertEqual((word, speaker), ('call.', 'S'))
+        self.assertAlmostEqual(start, 100.21319)
+        self.assertEqual(end, 100.23319)
         with self.assertRaisesRegex(ValueError, "word='bad'"):
             MonoPostTrainingDataset._validate_alignments(
                 [['bad', [100.27, 100.5], 'S']], 100.23319

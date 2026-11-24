@@ -485,6 +485,12 @@ def evaluate(
                 text_logits, text_mask,
                 streams,
                 text_padding_id=text_padding_id,
+                text_epad_id=config.text_epad_id,
+                text_control_ids=tuple(
+                    token_id for token_id in (
+                        config.wait_token_id, config.spk_token_id, config.hear_token_id
+                    ) if token_id is not None
+                ),
                 text_padding_weight=config.text_padding_weight,
                 audio_logits=audio_logits,
                 audio_mask=audio_mask,
@@ -677,6 +683,10 @@ def run_training() -> None:
     objective = TrainingObjective(
         model,
         config.text_padding_id,
+        config.text_epad_id,
+        tuple(token_id for token_id in (
+            config.wait_token_id, config.spk_token_id, config.hear_token_id
+        ) if token_id is not None),
         config.text_padding_weight,
         config.text_loss_weight,
         config.audio_loss_weight,
@@ -1054,6 +1064,7 @@ def run_training() -> None:
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
                     f"{audio_log}"
                     f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
+                    f"assistant_lexical_accuracy={metrics['assistant/lexical_accuracy'].item():.3f} "
                     f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f} "
                     f"{rq_log}",
                     flush=True,
@@ -1098,6 +1109,7 @@ def run_training() -> None:
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
                     f"assistant_np_accuracy={valid_metrics['assistant/non_pad_accuracy']:.3f} "
+                    f"assistant_lexical_accuracy={valid_metrics['assistant/lexical_accuracy']:.3f} "
                     f"assistant_all_accuracy={valid_metrics['assistant/accuracy']:.3f} "
                     f"{audio_log} {rq_log}",
                     flush=True,

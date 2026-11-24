@@ -25,6 +25,22 @@ from moshi.models.lm_utils import _delay_sequence
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_lexical_accuracy_excludes_padding_epad_and_control_tokens(self):
+        targets = torch.tensor([[[10, 11, 12, 13, 14, 2, 3]]])
+        logits = torch.zeros(1, 1, 7, 16)
+        # Special tokens are intentionally predicted incorrectly. Of the two
+        # lexical tokens, token 2 is correct and token 3 is incorrect.
+        logits[..., 0] = 1
+        logits[0, 0, 5, 2] = 2
+        mask = torch.ones(1, 1, 7, dtype=torch.bool)
+        _, metrics = masked_multistream_loss(
+            logits, mask, targets,
+            text_padding_id=10,
+            text_epad_id=11,
+            text_control_ids=(12, 13, 14),
+        )
+        self.assertEqual(metrics["assistant/lexical_accuracy"].item(), 0.5)
+
     def test_stereo_minimum_bpe_tokens(self):
         class Tokenizer:
             def encode(self, text, **kwargs):

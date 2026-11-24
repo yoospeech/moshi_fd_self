@@ -263,6 +263,8 @@ def masked_multistream_loss(
     streams: torch.Tensor,
     *,
     text_padding_id: int | None = None,
+    text_epad_id: int | None = None,
+    text_control_ids: tuple[int, ...] = (),
     text_padding_weight: float = 0.5,
     audio_logits: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
@@ -301,10 +303,21 @@ def masked_multistream_loss(
             if non_pad.any()
             else logits.new_zeros(())
         )
+        lexical = non_pad.clone()
+        if text_epad_id is not None:
+            lexical &= targets != text_epad_id
+        for control_id in text_control_ids:
+            lexical &= targets != control_id
+        lexical_accuracy = (
+            (predictions[lexical] == targets[lexical]).float().mean()
+            if lexical.any()
+            else logits.new_zeros(())
+        )
         channel_losses.append(channel_loss)
         metrics[f"loss/{name}"] = channel_loss.detach()
         metrics[f"{name}/accuracy"] = (predictions == targets).float().mean().detach()
         metrics[f"{name}/non_pad_accuracy"] = non_pad_accuracy.detach()
+        metrics[f"{name}/lexical_accuracy"] = lexical_accuracy.detach()
 
     text_loss = torch.stack(channel_losses).mean()
     total = text_loss_weight * text_loss

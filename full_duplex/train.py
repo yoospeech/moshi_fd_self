@@ -140,7 +140,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sine-frequency", type=float, default=440.0)
     parser.add_argument("--sine-amplitude", type=float, default=0.5)
-    parser.add_argument("--monologue-lead-frames", type=int, default=1)
     parser.add_argument("--resume", type=Path,
                         help="resume model, optimizer and step from a local checkpoint; steps is the total target")
     parser.add_argument("--alignment-mode", choices=("online", "sidecar"), default="online",
@@ -790,7 +789,6 @@ def run_training() -> None:
                     hear_token_id=control_ids["hear"],
                     sample_rate=24000,
                     frame_rate=config.frame_rate,
-                    monologue_lead_frames=args.monologue_lead_frames,
                     min_duration=args.min_duration,
                     max_duration=args.max_duration,
                     min_text_tokens=args.min_text_tokens,

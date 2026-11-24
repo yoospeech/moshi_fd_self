@@ -13,7 +13,6 @@ train_full_duplex.py \
   --enable-sine-conditioning \
   --sine-frequency 440 \
   --sine-amplitude 0.5 \
-  --monologue-lead-frames 1 \
   --model models/LFM3-1.7B \
   --trust-remote-code \
   --disable-lfm3-triton \

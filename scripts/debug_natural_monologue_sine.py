@@ -29,7 +29,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-token-id", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--spk-token-id", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--hear-token-id", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--monologue-lead-frames", type=int, default=1)
     parser.add_argument("--sine-frequency", type=float, default=440.0)
     parser.add_argument("--sine-amplitude", type=float, default=0.5)
     parser.add_argument("--mimi-checkpoint", type=Path)
@@ -85,7 +84,6 @@ def main() -> None:
             hear_token_id=control_ids["hear"],
             sample_rate=24_000,
             frame_rate=12.5,
-            monologue_lead_frames=args.monologue_lead_frames,
             min_duration=0,
             min_text_tokens=0,
             enable_sine_conditioning=True,

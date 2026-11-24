@@ -77,7 +77,7 @@ def load_config(args: argparse.Namespace) -> FullDuplexConfig:
     elif args.model and "lfm3" in args.model.lower():
         values["trust_remote_code"] = True
     config = FullDuplexConfig(**values)
-    expected_delays = [0] + ([0] + [1] * (config.num_codebooks - 1)) * 2
+    expected_delays = [0] + [1] * (config.num_codebooks * 2)
     if config.delays != expected_delays:
         raise ValueError(
             "Checkpoint delay pattern is incompatible with Moshi-style inference: "

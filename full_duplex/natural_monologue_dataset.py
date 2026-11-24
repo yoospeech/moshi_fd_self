@@ -86,25 +86,11 @@ def discover_behavior_sd_entries(
                 if not monologues:
                     raise ValueError("no assistant text")
                 monologues.sort(key=lambda item: item["start"])
-                # Behavior-SD sometimes splits uninterrupted speech from one
-                # channel into adjacent utterances.  Keep the original onset
-                # and join only touching/overlapping text spans so their BPE
-                # timelines cannot compete for the same acoustic frame.
-                merged: list[dict[str, Any]] = []
-                for item in monologues:
-                    if (
-                        merged
-                        and merged[-1].get("end") is not None
-                        and item["start"] <= merged[-1]["end"] + 1e-6
-                    ):
-                        merged[-1]["text"] += " " + item["text"]
-                        if item.get("end") is not None:
-                            merged[-1]["end"] = max(merged[-1]["end"], item["end"])
-                    else:
-                        merged.append(item.copy())
+                # Preserve every annotated onset. Joining adjacent utterances
+                # would move the later text to the earlier utterance's time.
                 monologues = [
                     {"start": item["start"], "text": item["text"]}
-                    for item in merged
+                    for item in monologues
                 ]
                 info = sf.info(audio_path)
                 if info.channels != 2 or info.frames <= 0:
@@ -143,9 +129,9 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
 
     A single ``assistant_text`` string is also accepted.  With multiple texts,
     entries may be objects containing an optional coarse ``start``.  Otherwise
-    texts are paired in order with assistant VAD segments.  Text begins
-    ``monologue_lead_frames`` before the corresponding assistant speech onset,
-    giving one-frame text-to-audio interleaving by default.
+    texts are paired in order with assistant VAD segments. Text stays on its
+    annotated speech onset; model-level audio delay provides text-to-audio
+    interleaving without shifting the text timeline.
     """
 
     def __init__(
@@ -158,7 +144,6 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         hear_token_id: int,
         sample_rate: int = 24_000,
         frame_rate: float = 12.5,
-        monologue_lead_frames: int = 1,
         user_channel: int = 1,
         assistant_channel: int = 0,
         min_duration: float = 0.0,
@@ -183,7 +168,6 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
         self.hear_token_id = int(hear_token_id)
         self.sample_rate = int(sample_rate)
         self.frame_rate = float(frame_rate)
-        self.monologue_lead_frames = int(monologue_lead_frames)
         self.user_channel = int(user_channel)
         self.assistant_channel = int(assistant_channel)
         self.min_text_tokens = int(min_text_tokens)
@@ -198,8 +182,6 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             raise ValueError("WAIT, SPK, and HEAR token IDs must be distinct")
         if self.sample_rate <= 0 or self.frame_rate <= 0:
             raise ValueError("sample_rate and frame_rate must be positive")
-        if self.monologue_lead_frames < 0:
-            raise ValueError("monologue_lead_frames must be non-negative")
         if self.user_channel == self.assistant_channel:
             raise ValueError("user and assistant channels must differ")
         if self.min_text_tokens < 0:
@@ -381,10 +363,10 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                         f"segments for {len(entry['monologues'])} monologues"
                     )
                 speech_start = assistant_intervals[monologue_index][0]
-            start = max(
-                0,
-                math.floor(speech_start * self.frame_rate) - self.monologue_lead_frames,
-            )
+            # Place text on the audio frame containing its annotated onset.
+            # Text is never shifted to manufacture text/audio interleaving;
+            # the model's delay pattern delays audio instead.
+            start = max(0, math.floor(speech_start * self.frame_rate))
             required = start + len(pieces)
             if required > stream.numel():
                 if self.enable_sine_conditioning:

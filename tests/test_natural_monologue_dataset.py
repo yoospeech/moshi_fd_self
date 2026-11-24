@@ -1,6 +1,7 @@
 """Regression checks for contiguous Natural Monologue batches."""
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +26,10 @@ class Tokenizer:
             "부산도 맑습니다": [5, 6, 3, 4],
             "짧게": [7],
             "아주 긴 텍스트": list(range(20, 32)),
+            "I get that. Maybe, um, taking a break could help?": [30, 31, 32, 33],
+            "Yeah, I think you're right.": [40, 41, 42],
+            "Yeah, yeah.": list(range(50, 58)),
+            "What you said about...": [60, 61, 62],
         }[text]
 
 
@@ -63,7 +68,7 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 ],
             )
 
-    def test_discovery_merges_touching_assistant_utterances(self):
+    def test_discovery_preserves_touching_assistant_utterance_onsets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             audio_path = root / "0001.wav"
@@ -99,7 +104,8 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
 
             self.assertEqual(stats, {"audio": 1, "paired": 1, "invalid": 0})
             self.assertEqual(entries[0]["assistant_texts"], [
-                {"start": 0.5, "text": "first second"},
+                {"start": 0.5, "text": "first"},
+                {"start": 1.0, "text": "second"},
                 {"start": 2.5, "text": "third"},
             ])
 
@@ -109,7 +115,6 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
         *,
         texts=None,
         enable_sine_conditioning=False,
-        monologue_lead_frames=1,
     ) -> NaturalMonologueDataset:
         manifest = root / "natural.jsonl"
         manifest.write_text(
@@ -138,7 +143,6 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
             sample_rate=100,
             frame_rate=10,
             enable_sine_conditioning=enable_sine_conditioning,
-            monologue_lead_frames=monologue_lead_frames,
         )
 
     def test_contiguous_bpe_then_hear_spk_wait(self):
@@ -157,7 +161,7 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 item = dataset[0]
             self.assertEqual(
                 item["assistant_text_tokens"].tolist(),
-                [1, 2, 3, 4, 12, 12, 11, 11, 10, 10],
+                [10, 1, 2, 3, 4, 12, 11, 11, 10, 10],
             )
             self.assertEqual(item["text_only_tokens"].tolist(), [1, 2, 3, 4])
             self.assertTrue((item["waveform"] < 0).all())
@@ -214,11 +218,11 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 user_intervals=[(0.0, 0.5)],
                 assistant_intervals=[(0.3, 0.6)],
             )
-            self.assertEqual(text.tolist(), [1, 2, 3, 4, 12, 11, 10, 10, 10, 10])
-            # Frames 0-2: HEAR overwritten by BPE while assistant is silent.
+            self.assertEqual(text.tolist(), [12, 1, 2, 3, 4, 11, 10, 10, 10, 10])
+            # Frames 1-2: HEAR overwritten by BPE while assistant is silent.
             self.assertEqual(
                 sine_mask.tolist(),
-                [True, True, True, False, False, False, False, False, False, False],
+                [False, True, True, False, False, False, False, False, False, False],
             )
             # BPE+assistant speech, HEAR-only, WAIT and SPK are all excluded.
             self.assertFalse(sine_mask[3])
@@ -288,7 +292,7 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
             )
             self.assertFalse(sine_mask.any())
 
-    def test_lead_zero_and_multiple_monologues(self):
+    def test_multiple_monologues_use_annotated_onset_frames(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = self._dataset(
                 Path(directory),
@@ -297,7 +301,6 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                     {"start": 0.6, "text": "짧게"},
                 ],
                 enable_sine_conditioning=True,
-                monologue_lead_frames=0,
             )
             text, dense, sine_mask = dataset._text_stream(
                 dataset.entries[0], 10, [(0.0, 0.8)], [(0.1, 0.2), (0.6, 0.7)]
@@ -306,6 +309,55 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
             self.assertEqual(text[1].item(), 7)
             self.assertEqual(text[6].item(), 7)
             self.assertFalse(sine_mask.any())  # Both BPE frames contain assistant speech.
+
+    def test_behavior_sd_text_uses_exact_annotated_audio_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "natural.jsonl"
+            manifest.write_text(json.dumps({
+                "path": "dialog.wav",
+                "duration": 31.0,
+                "assistant_texts": [
+                    {"start": 23.49968253968254,
+                     "text": "I get that. Maybe, um, taking a break could help?"},
+                    {"start": 28.733242630385487,
+                     "text": "Yeah, I think you're right."},
+                ],
+            }) + "\n")
+            dataset = NaturalMonologueDataset(
+                manifest, Tokenizer(), wait_token_id=10, spk_token_id=11,
+                hear_token_id=12, frame_rate=12.5, min_text_tokens=0,
+            )
+            text, _dense, _sine = dataset._text_stream(
+                dataset.entries[0], 388, [], []
+            )
+            first_frame = math.floor(23.49968253968254 * 12.5)
+            second_frame = math.floor(28.733242630385487 * 12.5)
+            self.assertEqual(first_frame, 293)
+            self.assertEqual(second_frame, 359)
+            self.assertEqual(text[first_frame:first_frame + 4].tolist(), [30, 31, 32, 33])
+            self.assertEqual(text[second_frame:second_frame + 3].tolist(), [40, 41, 42])
+
+    def test_overlapping_bpe_timelines_are_rejected_without_moving_onsets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "natural.jsonl"
+            manifest.write_text(json.dumps({
+                "path": "dialog.wav",
+                "duration": 62.0,
+                "assistant_texts": [
+                    {"start": 60.52, "text": "Yeah, yeah."},
+                    {"start": 61.06, "text": "What you said about..."},
+                ],
+            }) + "\n")
+            dataset = NaturalMonologueDataset(
+                manifest, Tokenizer(), wait_token_id=10, spk_token_id=11,
+                hear_token_id=12, frame_rate=12.5, min_text_tokens=0,
+            )
+            self.assertEqual(math.floor(60.52 * 12.5), 756)
+            self.assertEqual(math.floor(61.06 * 12.5), 763)
+            with self.assertRaisesRegex(ValueError, "overlap at frame 763"):
+                dataset._text_stream(dataset.entries[0], 775, [], [])
 
     def test_text_longer_than_audio_fails_when_sine_is_enabled(self):
         with tempfile.TemporaryDirectory() as directory:

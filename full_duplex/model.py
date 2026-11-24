@@ -59,7 +59,10 @@ class FullDuplexConfig:
 
     @property
     def audio_delays(self) -> list[int]:
-        return [0] + [self.acoustic_delay_steps] * (self.num_codebooks - 1)
+        # Text remains on its annotated frame.  Delay every audio codebook by
+        # the same amount so the model observes/predicts text before the
+        # corresponding audio frame.
+        return [self.acoustic_delay_steps] * self.num_codebooks
 
 
 class MoshiFullDuplexModel(LMModel):

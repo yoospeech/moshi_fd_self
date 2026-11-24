@@ -86,7 +86,6 @@ next to the checkpoint, and uses the resulting IDs consistently:
       --folders '/path/to/behavior-sd/validation:en' \
       --enable-sine-conditioning \
       --sine-frequency 440 --sine-amplitude 0.5 \
-      --monologue-lead-frames 1 \
       --model models/LFM3-1.7B --batch-size 4 --steps 1000 \
       --output runs/natural_sine
 

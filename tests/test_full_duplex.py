@@ -175,13 +175,13 @@ class AlignmentTests(unittest.TestCase):
 class ModelTests(unittest.TestCase):
     def test_moshi_interleaving_delay_for_both_audio_streams(self):
         cfg = FullDuplexConfig(num_codebooks=4, acoustic_delay_steps=1)
-        self.assertEqual(cfg.delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
+        self.assertEqual(cfg.delays, [0, 1, 1, 1, 1, 1, 1, 1, 1])
         raw = torch.arange(9 * 4).view(1, 9, 4)
         initial = torch.full((1, 9, 1), 99, dtype=torch.long)
         delayed = _delay_sequence(cfg.delays, raw, initial)
-        for stream in (0, 1, 5):
+        for stream in (0,):
             torch.testing.assert_close(delayed[:, stream], raw[:, stream])
-        for stream in (2, 3, 4, 6, 7, 8):
+        for stream in range(1, 9):
             self.assertEqual(delayed[0, stream, 0].item(), 99)
             torch.testing.assert_close(
                 delayed[0, stream, 1:], raw[0, stream, :-1]
@@ -214,7 +214,7 @@ class ModelTests(unittest.TestCase):
                 config=str(config_path),
                 model=None,
             )
-            self.assertEqual(load_config(args).delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
+            self.assertEqual(load_config(args).delays, [0, 1, 1, 1, 1, 1, 1, 1, 1])
             base["acoustic_delay_steps"] = 2
             config_path.write_text(json.dumps(base))
             with self.assertRaisesRegex(ValueError, "expected"):
@@ -236,7 +236,7 @@ class ModelTests(unittest.TestCase):
             )
             model = MoshiFullDuplexModel(cfg, device="cpu", dtype=torch.float32)
             model.eval()
-            self.assertEqual(cfg.delays, [0, 0, 1, 1, 1, 0, 1, 1, 1])
+            self.assertEqual(cfg.delays, [0, 1, 1, 1, 1, 1, 1, 1, 1])
             causal_probe = torch.randint(0, 16, (1, 9, 12))
             with torch.no_grad():
                 reference = model.forward_training(

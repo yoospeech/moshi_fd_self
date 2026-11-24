@@ -63,6 +63,46 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 ],
             )
 
+    def test_discovery_merges_touching_assistant_utterances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "0001.wav"
+            sf.write(audio_path, np.zeros((400, 2), dtype=np.float32), 100)
+            audio_path.with_suffix(".json").write_text(json.dumps({
+                "file_name": "0001.flac",
+                "utterances": [
+                    {
+                        "speaker_idx": 0,
+                        "start_time": 0.5,
+                        "end_time": 1.0,
+                        "tts_text": "first",
+                        "backchannels": [],
+                    },
+                    {
+                        "speaker_idx": 0,
+                        "start_time": 1.0,
+                        "end_time": 2.0,
+                        "tts_text": "second",
+                        "backchannels": [],
+                    },
+                    {
+                        "speaker_idx": 0,
+                        "start_time": 2.5,
+                        "end_time": 3.0,
+                        "tts_text": "third",
+                        "backchannels": [],
+                    },
+                ],
+            }), encoding="utf-8")
+
+            entries, stats = discover_behavior_sd_entries(f"{root}:en")
+
+            self.assertEqual(stats, {"audio": 1, "paired": 1, "invalid": 0})
+            self.assertEqual(entries[0]["assistant_texts"], [
+                {"start": 0.5, "text": "first second"},
+                {"start": 2.5, "text": "third"},
+            ])
+
     def _dataset(
         self,
         root: Path,

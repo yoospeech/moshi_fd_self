@@ -64,22 +64,48 @@ def discover_behavior_sd_entries(
                     if speaker == assistant_channel:
                         text = str(utterance.get("tts_text", "")).strip()
                         if text:
-                            monologues.append({
+                            item = {
                                 "start": float(utterance["start_time"]),
                                 "text": text,
-                            })
+                            }
+                            if utterance.get("end_time") is not None:
+                                item["end"] = float(utterance["end_time"])
+                            monologues.append(item)
                     else:
                         # Nested backchannels are spoken by the listener.
                         for backchannel in utterance.get("backchannels", []):
                             text = str(backchannel.get("tts_text", "")).strip()
                             if text:
-                                monologues.append({
+                                item = {
                                     "start": float(backchannel["start_time"]),
                                     "text": text,
-                                })
+                                }
+                                if backchannel.get("end_time") is not None:
+                                    item["end"] = float(backchannel["end_time"])
+                                monologues.append(item)
                 if not monologues:
                     raise ValueError("no assistant text")
                 monologues.sort(key=lambda item: item["start"])
+                # Behavior-SD sometimes splits uninterrupted speech from one
+                # channel into adjacent utterances.  Keep the original onset
+                # and join only touching/overlapping text spans so their BPE
+                # timelines cannot compete for the same acoustic frame.
+                merged: list[dict[str, Any]] = []
+                for item in monologues:
+                    if (
+                        merged
+                        and merged[-1].get("end") is not None
+                        and item["start"] <= merged[-1]["end"] + 1e-6
+                    ):
+                        merged[-1]["text"] += " " + item["text"]
+                        if item.get("end") is not None:
+                            merged[-1]["end"] = max(merged[-1]["end"], item["end"])
+                    else:
+                        merged.append(item.copy())
+                monologues = [
+                    {"start": item["start"], "text": item["text"]}
+                    for item in merged
+                ]
                 info = sf.info(audio_path)
                 if info.channels != 2 or info.frames <= 0:
                     raise ValueError("expected nonempty stereo audio")

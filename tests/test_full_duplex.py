@@ -19,7 +19,7 @@ from full_duplex.inference import (
 )
 from full_duplex.train import (
     acoustic_prompt_mask, mask_audio_batch_text, mix_text_only_samples,
-    resolve_model_source, text_only_streams,
+    resolve_model_source, text_only_streams, uses_mixed_text_training,
 )
 from moshi.models.lm_utils import _delay_sequence
 
@@ -92,6 +92,11 @@ class AlignmentTests(unittest.TestCase):
         self.assertTrue((mixed[~mask, 1:] == -1).all())
         self.assertTrue((mixed[mask, 1:5, :3] == 2).all())
         self.assertTrue(torch.equal(mixed[~mask, 0], batch["text_only_tokens"][~mask]))
+
+    def test_natural_monologue_finetuning_uses_mixed_text_rows(self):
+        self.assertTrue(uses_mixed_text_training("finetuning", True))
+        self.assertTrue(uses_mixed_text_training("mono_post_training", False))
+        self.assertFalse(uses_mixed_text_training("finetuning", False))
 
     def test_text_only_stream_uses_entire_batch_and_no_audio(self):
         batch = {"text_only_tokens": torch.tensor([[1, 2, -1], [3, 4, 5]])}

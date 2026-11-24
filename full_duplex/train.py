@@ -97,6 +97,13 @@ def acoustic_prompt_mask(
     return mask
 
 
+def uses_mixed_text_training(task: str, natural_monologue: bool) -> bool:
+    """Whether a training batch may replace rows with dense text-only data."""
+    return task == "mono_post_training" or (
+        task == "finetuning" and natural_monologue
+    )
+
+
 def resolve_model_source(model: str, download_root: str) -> tuple[Path, str | None]:
     """Return the local model path and an optional repository to download."""
     requested = Path(model)
@@ -186,7 +193,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--text-only-fraction", type=float, default=0.5,
-        help="probability that a complete mono batch uses dense text only (default: 0.5)",
+        help=(
+            "fraction of each mono or natural-monologue batch replaced with "
+            "dense text-only rows (default: 0.5)"
+        ),
     )
     parser.add_argument(
         "--audio-text-mask-probability", type=float, default=0.3,
@@ -958,9 +968,12 @@ def run_training() -> None:
                 batch["streams"].shape[0]
                 if args.smoke_test else batch["assistant_text_tokens"].shape[0]
             )
+            mixed_text_training = uses_mixed_text_training(
+                args.task, args.natural_monologue
+            )
             acoustic_mask = (
                 acoustic_prompt_mask(batch_size, args.text_only_fraction, device=device)
-                if args.task == "mono_post_training" else
+                if mixed_text_training else
                 torch.ones(batch_size, dtype=torch.bool, device=device)
             )
             if args.smoke_test:
@@ -969,7 +982,7 @@ def run_training() -> None:
             else:
                 assert mimi is not None
                 streams = online_streams(batch, mimi, device, config, acoustic_mask)
-                if args.task == "mono_post_training":
+                if mixed_text_training:
                     streams = mix_text_only_samples(streams, batch, acoustic_mask)
             streams, text_targets = mask_audio_batch_text(
                 streams,

@@ -91,14 +91,16 @@ the backbone and Mimi together.
 alignment sidecars.
 
 The same recursive folder loader used by mono post-training can read native
-stereo WAVs. It expects `<stem>.alignment.json` sidecars, uses assistant channel
-0 and user channel 1, and preserves the complete stereo timeline:
+stereo WAVs. It uses assistant channel 0 and user channel 1 and preserves the
+complete stereo timeline. With online alignment, each sample is transcribed
+lazily the first time its DDP rank loads it; no manifest or sidecar is required:
 
 ```bash
 PYTHONPATH=. python train_full_duplex.py \
   --task finetuning \
   --folders '/path/to/behavior-sd/validation:en' \
-  --alignment-mode sidecar \
+  --alignment-mode online \
+  --alignment-model turbo --alignment-device local \
   --model models/SmolLM2-135M \
   --batch-size 4 --steps 1000 \
   --output runs/stereo_finetuning
@@ -130,16 +132,17 @@ Example stereo DDP launch:
 PYTHONPATH=. torchrun --standalone --nproc_per_node=2 train_full_duplex.py \
   --model LFM3-1.7B --task finetuning \
   --folders '/path/to/behavior-sd/validation:en' \
-  --alignment-mode sidecar \
+  --alignment-mode online \
+  --alignment-model turbo --alignment-device local \
   --batch-size 4 --grad-accum 2 --steps 1000 \
   --output runs/stereo_ddp
 ```
 
 Batch size is per rank, so the effective batch above is
 `2 GPUs * 4 samples * 2 accumulation = 16`. Do not pass `--mimi-device` under
-DDP. Online alignment competes with the backbone and Mimi for memory on every
-rank; for multi-GPU training, create sidecars first and use
-`--alignment-mode sidecar`.
+DDP. `--alignment-device local` resolves to `cuda:LOCAL_RANK`, so every rank
+loads its own Whisper model on the same GPU as its backbone and Mimi. Use a
+smaller batch or CPU alignment if those three models do not fit together.
 
 ## Losses and metrics
 

@@ -135,7 +135,7 @@ class MonoPipelineTests(unittest.TestCase):
                                 else:
                                     ds._prepare_lazy_entry(0)
                         elif count < 5:
-                            with self.assertRaisesRegex(ValueError, 'empty mono post-training dataset'):
+                            with self.assertRaisesRegex(ValueError, 'empty post-training dataset'):
                                 MonoPostTrainingDataset(None, tokenizer, entries=[entry], **kwargs)
                         else:
                             ds = MonoPostTrainingDataset(None, tokenizer, entries=[entry], **kwargs)

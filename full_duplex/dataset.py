@@ -482,10 +482,10 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
         if not self.entries:
             if self.rejected["alignment"] == self.original_size:
                 raise ValueError(
-                    f"empty mono post-training dataset ({self.manifest or folders}); "
+                    f"empty post-training dataset ({self.manifest or folders}); "
                     "word-alignment sidecars are missing (run annotate.py first)"
                 )
-            raise ValueError(f"empty mono post-training dataset: {self.manifest or folders}")
+            raise ValueError(f"empty post-training dataset: {self.manifest or folders}")
 
     def _extract_alignment(self, entry: dict[str, Any]) -> list[Any]:
         """Run Whisper for one item on first DataLoader access."""

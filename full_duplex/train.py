@@ -110,7 +110,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alignment-mode", choices=("online", "sidecar"), default="online",
                         help="extract missing word alignments lazily while loading folder samples")
     parser.add_argument("--alignment-model", default="medium")
-    parser.add_argument("--alignment-device", default="cpu")
+    parser.add_argument(
+        "--alignment-device",
+        default="cpu",
+        help=(
+            "Whisper device; use 'local' to place one model on each DDP rank's "
+            "LOCAL_RANK GPU"
+        ),
+    )
     parser.add_argument(
         "--folders",
         help=(
@@ -472,6 +479,7 @@ def run_training() -> None:
             raise ValueError(f"{name} must be positive")
     rank, world_size, device = setup()
     primary = rank == 0
+    alignment_device = str(device) if args.alignment_device == "local" else args.alignment_device
     if world_size > 1 and args.mimi_device is not None:
         raise ValueError("DDP assigns Mimi to each rank's local device; omit --mimi-device")
     torch.manual_seed(args.seed)
@@ -640,7 +648,7 @@ def run_training() -> None:
             dataset = MonoPostTrainingDataset(
                 dataset_source, tokenizer, folders=args.folders, max_files=args.max_files,
                 online_alignment=bool(args.folders) and args.alignment_mode == "online",
-                whisper_model=args.alignment_model, alignment_device=args.alignment_device,
+                whisper_model=args.alignment_model, alignment_device=alignment_device,
                 sample_rate=24000, frame_rate=config.frame_rate,
                 text_padding_id=config.text_padding_id, text_epad_id=config.text_epad_id,
                 min_duration=args.min_duration, max_duration=args.max_duration,
@@ -670,7 +678,7 @@ def run_training() -> None:
                     max_files=args.max_files,
                     online_alignment=args.alignment_mode == "online",
                     whisper_model=args.alignment_model,
-                    alignment_device=args.alignment_device,
+                    alignment_device=alignment_device,
                     audio_mode="stereo",
                     sample_rate=24000,
                     frame_rate=config.frame_rate,

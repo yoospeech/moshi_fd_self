@@ -14,6 +14,7 @@ import torch
 from full_duplex.natural_monologue_dataset import (
     NaturalMonologueDataset,
     collate_natural_monologue,
+    clean_behavior_text,
     create_natural_monologue_dataloader,
     discover_behavior_sd_entries,
 )
@@ -34,6 +35,24 @@ class Tokenizer:
 
 
 class NaturalMonologueDatasetTests(unittest.TestCase):
+    def test_behavior_text_cleaner_preserves_speech_and_removes_markup(self):
+        self.assertEqual(
+            clean_behavior_text("<laughter>yeah</laughter>, [Oh, really?]"),
+            "yeah, Oh, really?",
+        )
+        self.assertEqual(clean_behavior_text("**Yeah.** **(hesitation)**"), "Yeah.")
+        self.assertEqual(clean_behavior_text("*Clears throat* hello"),
+                         "Clears throat hello")
+        self.assertEqual(clean_behavior_text("The roots are (x + 2)(x + 3)."),
+                         "The roots are (x + 2)(x + 3).")
+        self.assertIsNone(clean_behavior_text("[laughter] <sigh>"))
+
+    def test_behavior_text_cleaner_rejects_corruption(self):
+        for text in ("I was worried [", "yeah<!", "formula \\", "uh | okay"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    clean_behavior_text(text)
+
     def test_discovers_same_stem_behavior_sd_wav_and_json(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

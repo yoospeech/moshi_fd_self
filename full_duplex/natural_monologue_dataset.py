@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +19,51 @@ import sphn
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import PreTrainedTokenizerBase
+
+
+_NON_SPEECH_SQUARE = re.compile(
+    r"\[(?:[^\[\]]*\s)?(?:laughter|nods|gasps|surprised)\]",
+    re.IGNORECASE,
+)
+_NON_SPEECH_ROUND = re.compile(
+    r"\((?:pause|interrupt|interrupted|hesitation|softly)\)",
+    re.IGNORECASE,
+)
+_NON_SPEECH_ANGLE = re.compile(
+    r"</?laughter>|<(?:sigh|interrupted)>",
+    re.IGNORECASE,
+)
+
+
+def clean_behavior_text(text: str) -> str | None:
+    """Remove transcript markup without changing spoken words or timestamps."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"</?strong>", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = _NON_SPEECH_ANGLE.sub(" ", cleaned)
+    cleaned = _NON_SPEECH_SQUARE.sub(" ", cleaned)
+    cleaned = _NON_SPEECH_ROUND.sub(" ", cleaned)
+
+    # Markdown emphasis is formatting only; preserve the emphasized words.
+    cleaned = cleaned.replace("**", "")
+    cleaned = re.sub(r"\*([^*\n]+)\*", r"\1", cleaned)
+
+    # Remaining balanced wrappers contain spoken backchannels such as [yeah].
+    cleaned = re.sub(r"\[([^\[\]]+)\]", r"\1", cleaned)
+    cleaned = re.sub(r"<([^<>/]+)>", r"\1", cleaned)
+
+    # Leftovers indicate truncated markup or corrupted math exports.
+    if any(char in cleaned for char in "[]<>"):
+        raise ValueError(f"malformed transcript markup: {text!r}")
+    if cleaned.count("(") != cleaned.count(")"):
+        raise ValueError(f"unbalanced transcript parentheses: {text!r}")
+    if "\\" in cleaned or "|" in cleaned:
+        raise ValueError(f"corrupted transcript text: {text!r}")
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return cleaned or None
 
 
 def discover_behavior_sd_entries(
@@ -258,11 +304,14 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 start = float(item["start"]) if item.get("start") is not None else None
             else:
                 raise TypeError("assistant texts must be strings or objects")
-            if not text:
-                raise ValueError("assistant text is empty")
+            text = clean_behavior_text(text)
+            if text is None:
+                continue
             if start is not None and (not math.isfinite(start) or not 0 <= start < duration):
                 raise ValueError(f"invalid monologue start: {start}")
             monologues.append({"text": text, "start": start})
+        if not monologues:
+            raise ValueError("assistant transcript contains no lexical text")
         return {
             **raw,
             "path": str(path),

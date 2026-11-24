@@ -64,7 +64,7 @@ class SkipInvalidDataset(Dataset):
             except RecoverableSampleError as error:
                 self.invalid_indices.add(candidate)
                 last_error = error
-                print(f"skipping invalid mono sample: {error}", flush=True)
+                print(f"skipping invalid sample: {error}", flush=True)
         raise RuntimeError("no valid samples remain in dataset split") from last_error
 
 

@@ -140,8 +140,15 @@ class AlignmentTests(unittest.TestCase):
         a = ds._aligned_text_stream(user, 8)
         self.assertEqual(a.tolist(), [11, 1, 2, 3, 10, 10, 10, 10])
         user[1][1][0] = .16
-        with self.assertRaises(TextAlignmentCollision):
-            ds._aligned_text_stream(user, 8)
+        self.assertEqual(ds._aligned_text_stream(user, 8).tolist(), a.tolist())
+        # Same-start words retain all pieces, even beyond the audio tail.
+        user[1][1][0] = 0
+        self.assertEqual(ds._aligned_text_stream(user, 2).tolist(), [11, 1, 2, 3])
+        # A later gap absorbs the shift; timestamps are not modified.
+        user.append(["next", [.56, .64], "SPEAKER_USER"])
+        self.assertEqual(ds._aligned_text_stream(user, 8).tolist(),
+                         [11, 1, 2, 3, 10, 10, 11, 3])
+        self.assertEqual(user[1][1][0], 0)
 
 
 class ModelTests(unittest.TestCase):

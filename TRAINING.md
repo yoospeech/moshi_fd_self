@@ -77,8 +77,17 @@ online alignment therefore uses `num_workers=0` and may use an
 `--alignment-device` such as `cuda:0`. Valid adjacent JSON sidecars are reused;
 missing or invalid alignments are extracted into memory and recomputed after
 restart. Empty alignments, invalid
-timestamps, unavailable word boundaries and BPE collisions are rejected.
+timestamps and unavailable word boundaries are rejected. Overlapping BPE
+pieces are shifted to the next free text frame instead of rejecting the sample.
+Audio and source timestamps remain unchanged. Later gaps absorb the shift;
+text extending beyond the audio is retained with audio targets masked out.
+There is currently no maximum shift limit, so dense speech can accumulate delay.
 Use `--alignment-mode sidecar` to require pre-existing JSON files.
+
+Skipped online samples report their failure stage and original error. The stages
+are `transcription_failed`, `empty_alignment`, `timestamp_validation_failed`,
+and `text_tokens_failed`. CUDA out-of-memory errors remain fatal rather than
+being treated as invalid samples.
 
 Folder language labels are passed to Whisper and returned in
 `batch["languages"]`. They do not balance languages or condition the model.
@@ -116,8 +125,8 @@ PYTHONPATH=. python train_full_duplex.py \
 
 Relative WAV paths resolve from the manifest directory. Channel defaults are
 assistant 0 and user 1, and can be overridden per manifest row. Filtering
-checks duration, minimum assistant BPE tokens, timestamps, speech coverage and
-BPE frame collisions.
+checks duration, minimum assistant BPE tokens, timestamps and speech coverage.
+BPE frame overlaps are resolved by shifting text forward.
 
 ## Model and distributed execution
 

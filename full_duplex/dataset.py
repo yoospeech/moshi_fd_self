@@ -227,7 +227,11 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
     def _aligned_text_stream(
         self, alignments: list[Any], frame_length: int
     ) -> torch.Tensor:
-        """Build the assistant response timeline on the audio clock."""
+        """Build text on the audio clock, shifting overlapping words forward.
+
+        Preserve every lexical piece, extending the text tail past audio when
+        necessary. Gaps allow later words to return to their original timing.
+        """
         def render() -> torch.Tensor:
             tokens = [self.text_padding_id] * frame_length
             # Track lexical pieces separately. PAD and EPAD may be replaced by
@@ -241,6 +245,7 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
                     lexical.extend([False] * extension)
 
             ordered = sorted(alignments, key=lambda item: float(item[1][0]))
+            next_free_frame = 1
             for word, timestamps, _speaker in ordered:
                 pieces = self._word_tokens(str(word))
                 if not pieces:
@@ -248,12 +253,9 @@ class StereoDialogueDataset(Dataset[dict[str, Any]]):
                 desired_start = max(0, round(float(timestamps[0]) * self.frame_rate))
                 # Moshi's t_i=1 special case: EPAD occupies the first frame and
                 # the lexical pieces move one frame to the right.
-                word_start = 1 if desired_start == 0 else desired_start
+                word_start = max(desired_start, next_free_frame)
                 ensure(word_start + len(pieces) - 1)
-                if any(lexical[word_start : word_start + len(pieces)]):
-                    raise TextAlignmentCollision(
-                        f"assistant-text BPE pieces collide at frame {word_start}"
-                    )
+                next_free_frame = word_start + len(pieces)
                 epad_position = word_start - 1
                 # Moshi equation (5): insert EPAD at t_i - 1 unless doing so
                 # would overwrite a lexical token from the previous word.
@@ -502,28 +504,44 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
             )
         alignment_start = time.perf_counter()
         try:
-            result = annotate.process_one(
-                Path(entry["path"]), None, entry["language"], self._alignment_model,
-                SimpleNamespace(keep_silence_in_segments=1.0),
-                channel=(
-                    int(entry.get("assistant_channel", self.assistant_channel))
-                    if self.audio_mode == "stereo" else 0
-                ),
-            )
-            alignments = self._validate_alignments(
-                result["alignments"], float(entry["duration"])
-            )
-            if not alignments:
-                raise ValueError("Whisper returned no word alignments")
+            try:
+                result = annotate.process_one(
+                    Path(entry["path"]), None, entry["language"], self._alignment_model,
+                    SimpleNamespace(keep_silence_in_segments=1.0),
+                    channel=(
+                        int(entry.get("assistant_channel", self.assistant_channel))
+                        if self.audio_mode == "stereo" else 0
+                    ),
+                )
+                raw_alignments = result["alignments"]
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                raise
+            except Exception as error:
+                self.timing_stats["alignment_failed"] += 1
+                raise RecoverableSampleError(
+                    f"{entry['path']}: stage=transcription_failed "
+                    f"error={type(error).__name__}: {error}"
+                ) from error
+
+            if not raw_alignments:
+                self.timing_stats["alignment_failed"] += 1
+                raise RecoverableSampleError(
+                    f"{entry['path']}: stage=empty_alignment "
+                    "error=Whisper returned no word alignments"
+                )
+
+            try:
+                alignments = self._validate_alignments(
+                    raw_alignments, float(entry["duration"])
+                )
+            except (ValueError, TypeError, KeyError, IndexError) as error:
+                self.timing_stats["alignment_failed"] += 1
+                raise RecoverableSampleError(
+                    f"{entry['path']}: stage=timestamp_validation_failed "
+                    f"error={type(error).__name__}: {error}"
+                ) from error
             self.timing_stats["alignment_extracted"] += 1
             return alignments
-        except (torch.cuda.OutOfMemoryError, MemoryError):
-            raise
-        except Exception as error:
-            self.timing_stats["alignment_failed"] += 1
-            raise RecoverableSampleError(
-                f"{entry['path']}: Whisper alignment failed"
-            ) from error
         finally:
             self.timing_stats["alignment_inference_seconds"] += (
                 time.perf_counter() - alignment_start
@@ -558,8 +576,8 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
         if count < self.min_text_tokens:
             self.rejected["text_tokens"] += 1
             raise RecoverableSampleError(
-                f"{path}: mono transcript rejected by text_tokens filter "
-                f"(text_tokens={count}, min_text_tokens={self.min_text_tokens})"
+                f"{path}: stage=text_tokens_failed "
+                f"text_tokens={count} min_text_tokens={self.min_text_tokens}"
             )
 
     def _dense_text_tokens(self, alignments: list[Any]) -> torch.Tensor:
@@ -606,13 +624,18 @@ class MonoPostTrainingDataset(StereoDialogueDataset):
     @staticmethod
     def _validate_alignments(alignments: list[Any], duration: float) -> list[Any]:
         result = []
-        for alignment in alignments:
+        for index, alignment in enumerate(alignments):
             if len(alignment) != 3:
-                raise ValueError("invalid alignment")
+                raise ValueError(
+                    f"alignment[{index}] must contain word, timestamps, and speaker"
+                )
             word, timestamps, speaker = alignment
             start, end = map(float, timestamps)
             if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start or end > duration + 0.05:
-                raise ValueError("invalid alignment timestamp")
+                raise ValueError(
+                    f"alignment[{index}] word={word!r} has invalid timestamp "
+                    f"start={start} end={end} duration={duration}"
+                )
             result.append([str(word), [start, end], speaker])
         return sorted(result, key=lambda item: item[1][0])
 

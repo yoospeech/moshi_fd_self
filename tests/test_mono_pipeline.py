@@ -66,7 +66,7 @@ class MonoPipelineTests(unittest.TestCase):
         self.assertEqual(dataset[0], 1)
         self.assertEqual(samples.calls, [0, 1, 1])
 
-    def test_bad_annotations_and_collision_are_filtered(self):
+    def test_bad_annotations_filtered_but_colliding_words_shifted(self):
         with tempfile.TemporaryDirectory() as directory:
             broken = Path(directory) / 'bad.json'
             broken.write_text('{')
@@ -81,9 +81,9 @@ class MonoPipelineTests(unittest.TestCase):
                 entry['duration'] = 4
             ds = MonoPostTrainingDataset(None, Tokenizer(), entries=entries,
                 text_padding_id=10, text_epad_id=11)
-            self.assertEqual(len(ds), 1)
+            self.assertEqual(len(ds), 2)
             self.assertEqual(ds.rejected['alignment'], 3)
-            self.assertEqual(ds.rejected['text_collision'], 1)
+            self.assertEqual(ds.rejected['text_collision'], 0)
 
     def test_online_extraction_language_and_no_json_writes(self):
         annotation = types.ModuleType('scripts.annotate')
@@ -128,8 +128,10 @@ class MonoPipelineTests(unittest.TestCase):
                                                          online_alignment=True, **kwargs)
                             with patch.object(ds, '_extract_alignment', return_value=words):
                                 if count < 5:
-                                    with self.assertRaisesRegex(RecoverableSampleError,
-                                                               'text_tokens=4, min_text_tokens=5'):
+                                    with self.assertRaisesRegex(
+                                        RecoverableSampleError,
+                                        'stage=text_tokens_failed text_tokens=4 min_text_tokens=5',
+                                    ):
                                         ds._prepare_lazy_entry(0)
                                     self.assertEqual(ds.rejected['text_tokens'], 1)
                                 else:
@@ -141,3 +143,33 @@ class MonoPipelineTests(unittest.TestCase):
                             ds = MonoPostTrainingDataset(None, tokenizer, entries=[entry], **kwargs)
                             self.assertEqual(len(ds), 1)
                         tokenizer.encode.assert_any_call(' utterance', add_special_tokens=False)
+
+    def test_online_alignment_failure_stages_are_reported(self):
+        annotation = types.ModuleType('scripts.annotate')
+        entry = {'path': 'sample.wav', 'duration': 4, 'language': 'en'}
+        cases = [
+            (RuntimeError('decoder failed'), 'stage=transcription_failed error=RuntimeError: decoder failed'),
+            ({'alignments': []}, 'stage=empty_alignment'),
+            ({'alignments': [['word', [0, 5], 'S']]},
+             'stage=timestamp_validation_failed error=ValueError:'),
+        ]
+        for output, message in cases:
+            with self.subTest(message=message):
+                annotation.process_one = Mock(
+                    side_effect=output if isinstance(output, Exception) else None,
+                    return_value=None if isinstance(output, Exception) else output,
+                )
+                ds = object.__new__(MonoPostTrainingDataset)
+                ds._alignment_model = object()
+                ds.audio_mode = 'stereo'
+                ds.assistant_channel = 0
+                ds.timing_stats = {
+                    'alignment_model_load_seconds': 0.0,
+                    'alignment_inference_seconds': 0.0,
+                    'alignment_extracted': 0,
+                    'alignment_failed': 0,
+                }
+                with patch.dict('sys.modules', {'scripts.annotate': annotation}):
+                    with self.assertRaisesRegex(RecoverableSampleError, message):
+                        ds._extract_alignment(entry)
+                self.assertEqual(ds.timing_stats['alignment_failed'], 1)

@@ -1,0 +1,56 @@
+Contiguous monologue + SPK / HEAR / WAIT example
+================================================
+
+Scenario
+--------
+The assistant begins saying "내일은 맑습니다".
+While the assistant is saying "내일은 맑습...", the user interrupts with
+"잠깐, 부산은 어때?". The assistant then responds with
+"부산은 맑습니다".
+
+Frame                   1       2       3       4       5       6       7       8       9       10      11      12      13      14
+Text                    내일    은      맑      습니다  SPK     HEAR    HEAR    HEAR    HEAR    WAIT    부산    은      맑      습니다
+Assistant audio         내      일은    맑      습      발화중  맑습... 중단    무음    무음    무음    무음    부산    은 맑   습니다
+User audio              무음    무음    무음    무음    무음    잠깐    부산은  어      때?     무음    무음    무음    무음    무음
+
+Timeline
+--------
+Text:
+[내일][은][맑][습니다][SPK][HEAR][HEAR][HEAR][HEAR][WAIT][부산][은][맑][습니다]
+
+Assistant audio:
+[------- "내일은 맑습..." -------][CUT][------ 무음 ------][-- "부산은 맑습니다" --]
+
+User audio:
+[---------- 무음 ----------][---- "잠깐, 부산은 어때?" ----][------ 무음 ------]
+
+Token assignment
+----------------
+1. If contiguous monologue BPE tokens remain, emit the next BPE token.
+2. Otherwise, if the user is speaking, emit HEAR.
+3. Otherwise, if the assistant audio is still speaking, emit SPK.
+4. Otherwise, emit WAIT.
+
+Pseudo-code
+-----------
+if monologue_tokens_remain:
+    token = next_monologue_bpe
+elif user_is_speaking:
+    token = HEAR
+elif assistant_is_speaking:
+    token = SPK
+else:
+    token = WAIT
+
+Notes
+-----
+- SPK means that monologue generation has finished, while its assistant
+  audio is still being emitted.
+- HEAR takes priority over SPK during overlapping speech. The assistant
+  audio stream still records that the assistant is speaking.
+- The first assistant utterance is interrupted in the middle of
+  "맑습니다", so the waveform contains only "내일은 맑습...". Even though
+  the contiguous text stream has already emitted the full monologue, the
+  remaining "니다" is not present in the assistant audio.
+- WAIT means that no monologue token remains and neither side is speaking.
+- The BPE split and frame timing above are simplified examples.

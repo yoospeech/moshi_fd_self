@@ -20,15 +20,6 @@ def assistant_texts(metadata: dict, assistant_channel: int) -> list[dict[str, ob
             text = str(utterance.get("tts_text", "")).strip()
             if text:
                 texts.append({"start": float(utterance["start_time"]), "text": text})
-        else:
-            # A backchannel nested under speaker N is spoken by the listener.
-            for backchannel in utterance.get("backchannels", []):
-                text = str(backchannel.get("tts_text", "")).strip()
-                if text:
-                    texts.append({
-                        "start": float(backchannel["start_time"]),
-                        "text": text,
-                    })
     texts.sort(key=lambda item: float(item["start"]))
     return texts
 
@@ -41,6 +32,18 @@ def user_backchannel_intervals(
         [float(backchannel["start_time"]), float(backchannel["end_time"])]
         for utterance in metadata.get("utterances", [])
         if int(utterance["speaker_idx"]) == assistant_channel
+        for backchannel in utterance.get("backchannels", [])
+    ]
+
+
+def assistant_backchannel_intervals(
+    metadata: dict, assistant_channel: int
+) -> list[list[float]]:
+    """Return suppressed assistant backchannels nested under user speech."""
+    return [
+        [float(backchannel["start_time"]), float(backchannel["end_time"])]
+        for utterance in metadata.get("utterances", [])
+        if int(utterance["speaker_idx"]) != assistant_channel
         for backchannel in utterance.get("backchannels", [])
     ]
 
@@ -101,6 +104,9 @@ def main() -> None:
                     "assistant_channel": args.assistant_channel,
                     "assistant_texts": utterances,
                     "user_backchannel_intervals": user_backchannel_intervals(
+                        metadata, args.assistant_channel
+                    ),
+                    "assistant_backchannel_intervals": assistant_backchannel_intervals(
                         metadata, args.assistant_channel
                     ),
                 }

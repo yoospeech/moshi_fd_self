@@ -189,7 +189,9 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                         "speaker_idx": 1,
                         "start_time": 0.4,
                         "tts_text": "ignored",
-                        "backchannels": [{"start_time": 0.5, "tts_text": "짧게"}],
+                        "backchannels": [
+                            {"start_time": 0.5, "end_time": 0.6, "tts_text": "짧게"}
+                        ],
                     },
                 ],
             }), encoding="utf-8")
@@ -199,12 +201,31 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
             self.assertEqual(entries[0]["path"], str(audio_path.resolve()))
             self.assertEqual(
                 entries[0]["assistant_texts"],
-                [
-                    {"start": 0.2, "text": "짧게"},
-                    {"start": 0.5, "text": "짧게"},
-                ],
+                [{"start": 0.2, "text": "짧게"}],
             )
             self.assertEqual(entries[0]["user_backchannel_intervals"], [(0.25, 0.35)])
+            self.assertEqual(entries[0]["assistant_backchannel_intervals"], [(0.5, 0.6)])
+
+    def test_overlapping_assistant_backchannels_stay_hear_and_sine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(
+                Path(directory), texts=[{"start": 0.0, "text": "짧게"}],
+                enable_sine_conditioning=True,
+            )
+            entry = dataset.entries[0] | {
+                "assistant_backchannel_intervals": [(0.2, 0.5), (0.3, 0.4)]
+            }
+            text, dense, schedule, _user = dataset._text_stream(
+                entry,
+                frame_length=10,
+                user_intervals=[(0.2, 0.5)],
+                # VAD sees the main Assistant frame and both backchannels.
+                assistant_intervals=[(0.0, 0.1), (0.2, 0.5)],
+            )
+            self.assertEqual(dense.tolist(), [7])
+            self.assertEqual(text[:7].tolist(), [7, 11, 10, 12, 12, 12, 10])
+            self.assertEqual(schedule[schedule >= 0].tolist(), [0])
+            self.assertTrue((schedule[2:6] == -1).all())
 
     def test_discovery_preserves_assistant_end_times(self):
         with tempfile.TemporaryDirectory() as directory:

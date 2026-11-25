@@ -95,6 +95,10 @@ from pause/resume. Their real user audio overlaps the continuing assistant
 audio, while the assistant BPE sequence continues without a HEAR token. With a
 one-frame audio delay, a user backchannel at source frame 2 is audible at frame
 3 on the user audio stream, alongside the assistant audio at frame 3.
+Assistant backchannels nested under user speech are suppressed: their text is
+not placed on the lexical timeline and their audio frames become sine. The text
+target remains HEAR for the delayed user-audio frames, so overlapping assistant
+backchannel annotations cannot collide in the single text stream.
 
 Enable it with a VAD-driven natural manifest or a Behavior-SD folder containing
 adjacent same-stem WAV/JSON pairs. Training registers

@@ -53,6 +53,12 @@ def behavior_sd_entry(metadata_path: Path, assistant_channel: int, user_channel:
         if int(item["speaker_idx"]) == assistant_channel
         for backchannel in item.get("backchannels", [])
     ]
+    assistant_backchannels = [
+        [float(backchannel["start_time"]), float(backchannel["end_time"])]
+        for item in metadata["utterances"]
+        if int(item["speaker_idx"]) != assistant_channel
+        for backchannel in item.get("backchannels", [])
+    ]
     if not monologues:
         raise ValueError(f"{metadata_path}: no utterances for speaker_idx={assistant_channel}")
     return {
@@ -64,6 +70,7 @@ def behavior_sd_entry(metadata_path: Path, assistant_channel: int, user_channel:
         "assistant_channel": assistant_channel,
         "assistant_texts": monologues,
         "user_backchannel_intervals": user_backchannels,
+        "assistant_backchannel_intervals": assistant_backchannels,
     }
 
 

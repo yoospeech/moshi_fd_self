@@ -133,12 +133,8 @@ def discover_behavior_sd_entries(
                 if not monologues:
                     raise ValueError("no assistant text")
                 monologues.sort(key=lambda item: item["start"])
-                # Preserve every annotated onset. Joining adjacent utterances
-                # would move the later text to the earlier utterance's time.
-                monologues = [
-                    {"start": item["start"], "text": item["text"]}
-                    for item in monologues
-                ]
+                # Keep end times so validation can join touching utterances
+                # before tokenizing the complete assistant monologue.
                 info = sf.info(audio_path)
                 if info.channels != 2 or info.frames <= 0:
                     raise ValueError("expected nonempty stereo audio")
@@ -302,11 +298,15 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             raise ValueError(f"entry {entry_index}: assistant transcript is empty")
         monologues = []
         for item in source:
+            end = None
             if isinstance(item, str):
                 text, start = item.strip(), None
             elif isinstance(item, dict):
                 text = str(item.get("text", "")).strip()
-                start = float(item["start"]) if item.get("start") is not None else None
+                start_value = item.get("start", item.get("start_time"))
+                start = float(start_value) if start_value is not None else None
+                end_value = item.get("end", item.get("end_time"))
+                end = float(end_value) if end_value is not None else None
             else:
                 raise TypeError("assistant texts must be strings or objects")
             text = clean_behavior_text(text)
@@ -314,7 +314,28 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 continue
             if start is not None and (not math.isfinite(start) or not 0 <= start < duration):
                 raise ValueError(f"invalid monologue start: {start}")
-            monologues.append({"text": text, "start": start})
+            if end is not None and (
+                start is None or not math.isfinite(end) or end <= start
+            ):
+                raise ValueError(f"invalid monologue end: {end}")
+            monologue = {"text": text, "start": start}
+            if end is not None:
+                monologue["end"] = end
+            if (
+                monologues
+                and start is not None
+                and monologues[-1].get("end") is not None
+                and math.isclose(monologues[-1]["end"], start, rel_tol=0.0, abs_tol=1e-6)
+            ):
+                # A later sentence now follows the previous text tokens rather
+                # than restarting at its own annotated onset.
+                previous = monologues[-1]
+                previous["text"] += " " + text
+                previous.pop("end")
+                if end is not None:
+                    previous["end"] = end
+            else:
+                monologues.append(monologue)
         if not monologues:
             raise ValueError("assistant transcript contains no lexical text")
         return {

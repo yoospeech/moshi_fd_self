@@ -33,6 +33,8 @@ class Tokenizer:
             "Yeah, I think you're right.": [40, 41, 42],
             "Yeah, yeah.": list(range(50, 58)),
             "What you said about...": [60, 61, 62],
+            "first second third": [21, 22, 23, 24],
+            "fourth": [25],
         }[text]
 
 
@@ -140,7 +142,7 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 ],
             )
 
-    def test_discovery_preserves_touching_assistant_utterance_onsets(self):
+    def test_discovery_preserves_assistant_end_times(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             audio_path = root / "0001.wav"
@@ -176,10 +178,38 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
 
             self.assertEqual(stats, {"audio": 1, "paired": 1, "invalid": 0})
             self.assertEqual(entries[0]["assistant_texts"], [
-                {"start": 0.5, "text": "first"},
-                {"start": 1.0, "text": "second"},
-                {"start": 2.5, "text": "third"},
+                {"start": 0.5, "end": 1.0, "text": "first"},
+                {"start": 1.0, "end": 2.0, "text": "second"},
+                {"start": 2.5, "end": 3.0, "text": "third"},
             ])
+
+    def test_touching_monologues_merge_before_tokenization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(Path(directory), texts=[
+                {"start_time": 0.1, "end_time": 0.2, "text": "first"},
+                {"start_time": 0.2000001, "end_time": 0.3, "text": "second"},
+                {"start_time": 0.3, "end_time": 0.5, "text": "third"},
+                {"start_time": 0.7, "end_time": 0.9, "text": "fourth"},
+            ])
+            self.assertEqual(dataset.entries[0]["monologues"], [
+                {"start": 0.1, "end": 0.5, "text": "first second third"},
+                {"start": 0.7, "end": 0.9, "text": "fourth"},
+            ])
+            dataset.tokenizer = SimpleNamespace(encode=lambda text, **kw: {
+                "first second third": [21, 22, 23, 24], "fourth": [25],
+            }[text])
+            text, dense, _, _ = dataset._text_stream(dataset.entries[0], 10, [], [])
+            self.assertEqual(text[1:5].tolist(), [21, 22, 23, 24])
+            self.assertEqual(text[7].item(), 25)
+            self.assertEqual(dense.tolist(), [21, 22, 23, 24, 25])
+
+    def test_overlapping_time_intervals_are_not_merged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(Path(directory), texts=[
+                {"start": 0.1, "end": 0.5, "text": "짧게"},
+                {"start": 0.4, "end": 0.8, "text": "짧게"},
+            ])
+            self.assertEqual(len(dataset.entries[0]["monologues"]), 2)
 
     def _dataset(
         self,

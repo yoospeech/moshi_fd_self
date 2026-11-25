@@ -106,6 +106,7 @@ def discover_behavior_sd_entries(
                 if Path(str(metadata["file_name"])).stem != audio_path.stem:
                     raise ValueError("metadata file_name stem does not match audio")
                 monologues: list[dict[str, Any]] = []
+                user_backchannel_intervals: list[tuple[float, float]] = []
                 for utterance in metadata["utterances"]:
                     speaker = int(utterance["speaker_idx"])
                     if speaker == assistant_channel:
@@ -118,6 +119,13 @@ def discover_behavior_sd_entries(
                             if utterance.get("end_time") is not None:
                                 item["end"] = float(utterance["end_time"])
                             monologues.append(item)
+                        # A backchannel nested under the assistant's utterance
+                        # is spoken by the user and must not interrupt it.
+                        for backchannel in utterance.get("backchannels", []):
+                            user_backchannel_intervals.append((
+                                float(backchannel["start_time"]),
+                                float(backchannel["end_time"]),
+                            ))
                     else:
                         # Nested backchannels are spoken by the listener.
                         for backchannel in utterance.get("backchannels", []):
@@ -149,6 +157,7 @@ def discover_behavior_sd_entries(
                 "user_channel": user_channel,
                 "assistant_channel": assistant_channel,
                 "assistant_texts": monologues,
+                "user_backchannel_intervals": user_backchannel_intervals,
             })
             stats["paired"] += 1
             if max_files and len(entries) >= max_files:
@@ -338,11 +347,20 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
                 monologues.append(monologue)
         if not monologues:
             raise ValueError("assistant transcript contains no lexical text")
+        user_backchannel_intervals = []
+        for interval in raw.get("user_backchannel_intervals", []):
+            if isinstance(interval, dict):
+                start, end = float(interval["start"]), float(interval["end"])
+            else:
+                start, end = map(float, interval)
+            self._validate_interval(start, end, duration)
+            user_backchannel_intervals.append((start, end))
         return {
             **raw,
             "path": str(path),
             "duration": duration,
             "monologues": monologues,
+            "user_backchannel_intervals": user_backchannel_intervals,
         }
 
     @staticmethod
@@ -412,6 +430,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         user_active = torch.zeros(frame_length, dtype=torch.bool)
         assistant_active = torch.zeros(frame_length, dtype=torch.bool)
+        user_backchannel_active = torch.zeros(frame_length, dtype=torch.bool)
         for target, intervals in (
             (user_active, user_intervals),
             (assistant_active, assistant_intervals),
@@ -419,6 +438,10 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             for start, end in intervals:
                 interval = self._frame_interval(start, end, frame_length)
                 target[interval.start:interval.stop] = True
+        for start, end in entry.get("user_backchannel_intervals", []):
+            interval = self._frame_interval(start, end, frame_length)
+            user_backchannel_active[interval.start:interval.stop] = True
+        interrupt_user_active = user_active & ~user_backchannel_active
 
         # Build the source timeline before the model delays both audio streams.
         stream = torch.full((frame_length,), self.wait_token_id, dtype=torch.long)
@@ -468,9 +491,9 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             # tail. Otherwise lexical tokens can replace HEAR on the final
             # user audio frame. Keep text/audio content paired in the queue.
             pause_user = torch.zeros(frame_length + self.audio_delay_steps, dtype=torch.bool)
-            pause_user[:frame_length] = user_active
+            pause_user[:frame_length] = interrupt_user_active
             for delay in range(1, self.audio_delay_steps + 1):
-                pause_user[delay:delay + frame_length] |= user_active
+                pause_user[delay:delay + frame_length] |= interrupt_user_active
             last_user = int(user_active.nonzero()[-1]) if user_active.any() else -1
             pause_user = pause_user[:max(frame_length, last_user + self.audio_delay_steps + 1)]
             padded_content = torch.zeros_like(pause_user)
@@ -488,6 +511,8 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             )
             output_user_active = torch.zeros(len(schedule), dtype=torch.bool)
             output_user_active[:frame_length] = user_active
+            output_interrupt_active = torch.zeros(len(schedule), dtype=torch.bool)
+            output_interrupt_active[:frame_length] = interrupt_user_active
             assistant_schedule = torch.full((len(schedule),), -1, dtype=torch.long)
             for output_frame, source_frame in enumerate(schedule):
                 if source_frame is not None and assistant_active[source_frame]:
@@ -497,7 +522,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             for output_frame, source_frame in enumerate(schedule):
                 audible_source = output_frame - self.audio_delay_steps
                 if audible_source >= 0:
-                    if output_user_active[audible_source]:
+                    if output_interrupt_active[audible_source]:
                         interleaved[output_frame] = self.hear_token_id
                     elif assistant_schedule[audible_source] >= 0:
                         interleaved[output_frame] = self.spk_token_id
@@ -508,7 +533,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             # Without pause/resume conditioning, retain the original aligned
             # behavior: lexical pieces take precedence over HEAR.
             lexical_tokens = stream[lexical].clone()
-            stream[:frame_length][user_active] = self.hear_token_id
+            stream[:frame_length][interrupt_user_active] = self.hear_token_id
             stream[lexical] = lexical_tokens
             assistant_schedule = torch.arange(frame_length, dtype=torch.long)
             output_user_active = user_active
@@ -648,6 +673,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             "user_audio_present": True,
             "user_vad_intervals": user_intervals,
             "assistant_vad_intervals": assistant_intervals,
+            "user_backchannel_intervals": entry.get("user_backchannel_intervals", []),
         }
         if self.enable_sine_conditioning:
             result.update(

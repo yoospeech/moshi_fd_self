@@ -90,6 +90,12 @@ words need not occupy one frame or line up with their BPE piece boundaries.
 Initial delayed audio slots use Mimi-encoded sine IDs saved in the checkpoint;
 the model's internal BOS remains separate from the displayed timeline.
 
+Behavior-SD user backchannels nested under an assistant utterance are exempt
+from pause/resume. Their real user audio overlaps the continuing assistant
+audio, while the assistant BPE sequence continues without a HEAR token. With a
+one-frame audio delay, a user backchannel at source frame 2 is audible at frame
+3 on the user audio stream, alongside the assistant audio at frame 3.
+
 Enable it with a VAD-driven natural manifest or a Behavior-SD folder containing
 adjacent same-stem WAV/JSON pairs. Training registers
 `<WAIT>`, `<SPK>`, and `<HEAR>` as tokenizer special tokens, saves that tokenizer

@@ -39,6 +39,50 @@ class Tokenizer:
 
 
 class NaturalMonologueDatasetTests(unittest.TestCase):
+    def test_user_backchannel_keeps_assistant_running_at_exact_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(Path(directory), enable_sine_conditioning=True)
+            dataset.tokenizer = SimpleNamespace(
+                encode=lambda *args, **kwargs: [21, 22, 23, 24, 25, 26]
+            )
+            entry = {
+                "path": "backchannel.wav",
+                "monologues": [{"text": "assistant sentence", "start": 0.0}],
+                # Source frame 2. With audio delay=1, it is audible at frame 3.
+                "user_backchannel_intervals": [(0.2, 0.3)],
+            }
+            text, dense, schedule, user_active = dataset._text_stream(
+                entry,
+                frame_length=10,
+                user_intervals=[(0.2, 0.3)],
+                assistant_intervals=[(0.0, 0.6)],
+            )
+            self.assertEqual(dense.tolist(), [21, 22, 23, 24, 25, 26])
+            self.assertEqual(text.tolist(), [21, 22, 23, 24, 25, 26, 11, 10, 10, 10])
+            self.assertEqual(schedule.tolist(), [0, 1, 2, 3, 4, 5, -1, -1, -1, -1])
+            self.assertEqual(user_active.nonzero().flatten().tolist(), [2])
+
+            sine, mhm = 90, 31
+            raw_assistant = torch.tensor([21, 22, 23, 24, 25, 26, sine, sine, sine, sine])
+            raw_user = torch.tensor([sine, sine, mhm, sine, sine, sine, sine, sine, sine, sine])
+            cfg = FullDuplexConfig(num_codebooks=1, sine_audio_token_ids=[sine])
+            stub = SimpleNamespace(
+                full_duplex_config=cfg,
+                audio_offset=1,
+                user_audio_offset=2,
+                _get_initial_token=lambda: torch.full((1, 3, 1), 99),
+            )
+            padding = MoshiFullDuplexModel.delay_padding(stub)
+            delayed = _delay_sequence(
+                cfg.delays,
+                torch.stack([text, raw_assistant, raw_user])[None],
+                padding,
+            )[0]
+            self.assertEqual(delayed[0].tolist(), [21, 22, 23, 24, 25, 26, 11, 10, 10, 10])
+            self.assertEqual(delayed[1].tolist(), [90, 21, 22, 23, 24, 25, 26, 90, 90, 90])
+            self.assertEqual(delayed[2].tolist(), [90, 90, 90, 31, 90, 90, 90, 90, 90, 90])
+            self.assertNotIn(dataset.hear_token_id, text.tolist())
+
     def test_hear_covers_entire_delayed_user_audio(self):
         for delay in (0, 1, 2, 3):
             for intervals in ([(0.0, 0.2)], [(0.0, 1.0)], [(0.0, 0.2), (0.3, 0.5)]):
@@ -137,7 +181,9 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                         "speaker_idx": 0,
                         "start_time": 0.2,
                         "tts_text": "짧게",
-                        "backchannels": [],
+                        "backchannels": [
+                            {"start_time": 0.25, "end_time": 0.35, "tts_text": "user bc"}
+                        ],
                     },
                     {
                         "speaker_idx": 1,
@@ -158,6 +204,7 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                     {"start": 0.5, "text": "짧게"},
                 ],
             )
+            self.assertEqual(entries[0]["user_backchannel_intervals"], [(0.25, 0.35)])
 
     def test_discovery_preserves_assistant_end_times(self):
         with tempfile.TemporaryDirectory() as directory:

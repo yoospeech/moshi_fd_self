@@ -33,6 +33,18 @@ def assistant_texts(metadata: dict, assistant_channel: int) -> list[dict[str, ob
     return texts
 
 
+def user_backchannel_intervals(
+    metadata: dict, assistant_channel: int
+) -> list[list[float]]:
+    """Return user backchannels nested under assistant utterances."""
+    return [
+        [float(backchannel["start_time"]), float(backchannel["end_time"])]
+        for utterance in metadata.get("utterances", [])
+        if int(utterance["speaker_idx"]) == assistant_channel
+        for backchannel in utterance.get("backchannels", [])
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, help="Behavior-SD split directory")
@@ -88,6 +100,9 @@ def main() -> None:
                     "user_channel": args.user_channel,
                     "assistant_channel": args.assistant_channel,
                     "assistant_texts": utterances,
+                    "user_backchannel_intervals": user_backchannel_intervals(
+                        metadata, args.assistant_channel
+                    ),
                 }
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 written += 1

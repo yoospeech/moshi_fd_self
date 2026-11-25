@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
+from full_duplex.dataset import RecoverableSampleError
 from full_duplex.natural_monologue_dataset import (
     NaturalMonologueDataset,
     collate_natural_monologue,
@@ -554,7 +555,9 @@ class NaturalMonologueDatasetTests(unittest.TestCase):
                 texts=[{"start": 0.5, "text": "아주 긴 텍스트"}],
                 enable_sine_conditioning=True,
             )
-            with self.assertRaisesRegex(ValueError, "complete text timeline"):
+            with self.assertRaisesRegex(
+                RecoverableSampleError, "complete text timeline"
+            ):
                 dataset._text_stream(
                     dataset.entries[0], 10, [(0.0, 1.0)], [(0.5, 0.8)]
                 )

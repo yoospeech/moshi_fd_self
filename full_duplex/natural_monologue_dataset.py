@@ -21,6 +21,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import PreTrainedTokenizerBase
 
+from .dataset import RecoverableSampleError
+
 
 _NON_SPEECH_SQUARE = re.compile(
     r"\[(?:[^\[\]]*\s)?(?:laughter|nods|gasps|surprised)\]",
@@ -473,7 +475,7 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             required = start + len(pieces)
             if required > stream.numel():
                 if self.enable_sine_conditioning:
-                    raise ValueError(
+                    raise RecoverableSampleError(
                         f"{entry['path']}: assistant text requires {required} frames "
                         f"but audio has only {frame_length}; sine conditioning requires "
                         "the complete text timeline to fit inside the audio timeline"

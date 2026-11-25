@@ -861,6 +861,10 @@ def run_training() -> None:
             [train_size, valid_size],
             generator=split_generator,
         )
+        # Keep the deterministic split indices separate from optional dataset
+        # wrappers so checkpoint resume validation still sees the same paths
+        # and split after a recoverably invalid sample is discovered.
+        train_indices = train_dataset.indices
         output_dir = Path(args.output)
         if primary:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -886,7 +890,10 @@ def run_training() -> None:
             if isinstance(dataset, NaturalMonologueDataset)
             else collate_duplex
         )
-        if lazy_folder_alignment:
+        skip_invalid_samples = lazy_folder_alignment or isinstance(
+            dataset, NaturalMonologueDataset
+        )
+        if skip_invalid_samples:
             train_dataset = SkipInvalidDataset(train_dataset)
             valid_dataset = SkipInvalidDataset(valid_dataset)
         if world_size > 1:
@@ -929,7 +936,7 @@ def run_training() -> None:
     if saved_progress:
         expected = {"world_size": world_size, "batch_size": args.batch_size,
                     "grad_accum": args.grad_accum, "seed": args.seed,
-                    "train_indices": train_dataset.dataset.indices if lazy_folder_alignment else train_dataset.indices,
+                    "train_indices": train_indices,
                     "paths": [entry["path"] for entry in dataset.entries]}
         for key, value in expected.items():
             if saved_progress[key] != value:
@@ -963,7 +970,7 @@ def run_training() -> None:
         return {"epoch": epoch, "next_batch": next_batch,
                 "world_size": world_size, "batch_size": args.batch_size,
                 "grad_accum": args.grad_accum, "seed": args.seed,
-                "train_indices": train_dataset.dataset.indices if lazy_folder_alignment else train_dataset.indices,
+                "train_indices": train_indices,
                 "paths": [entry["path"] for entry in dataset.entries], "rng": states}
     timing_totals = {"data": 0.0, "mimi": 0.0, "train": 0.0, "step": 0.0}
     timing_steps = 0

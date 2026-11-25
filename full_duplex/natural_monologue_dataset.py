@@ -464,12 +464,22 @@ class NaturalMonologueDataset(Dataset[dict[str, Any]]):
             lexical[start:required] = True
         if self.enable_sine_conditioning:
             assistant_content = assistant_active | lexical[:frame_length]
-            schedule = self._interleave_schedule(user_active, assistant_content)
+            # Pause during both the source user speech and its delayed audible
+            # tail. Otherwise lexical tokens can replace HEAR on the final
+            # user audio frame. Keep text/audio content paired in the queue.
+            pause_user = torch.zeros(frame_length + self.audio_delay_steps, dtype=torch.bool)
+            pause_user[:frame_length] = user_active
+            for delay in range(1, self.audio_delay_steps + 1):
+                pause_user[delay:delay + frame_length] |= user_active
+            last_user = int(user_active.nonzero()[-1]) if user_active.any() else -1
+            pause_user = pause_user[:max(frame_length, last_user + self.audio_delay_steps + 1)]
+            padded_content = torch.zeros_like(pause_user)
+            padded_content[:frame_length] = assistant_content
+            schedule = self._interleave_schedule(pause_user, padded_content)
             last_content = max(
                 (i for i, source in enumerate(schedule) if source is not None),
                 default=-1,
             )
-            last_user = int(user_active.nonzero()[-1]) if user_active.any() else -1
             # Keep the delayed audio tail and a final WAIT in the text timeline.
             required = max(len(schedule), max(last_content, last_user) + self.audio_delay_steps + 2)
             schedule.extend([None] * (required - len(schedule)))

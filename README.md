@@ -60,8 +60,8 @@ tests/                     regression tests
 ## Natural Monologue sine conditioning
 
 With `--enable-sine-conditioning`, user speech pauses assistant content.
-Interrupted assistant text/audio frames are queued in order and resume when
-the user stops. Empty source frames are not queued; unused frames in both
+Interrupted assistant text/audio frames are queued in order and resume after
+the last delayed user audio frame. Empty source frames are not queued; unused frames in both
 audio channels contain a sine wave. Pending content can extend the sample.
 The feature is disabled by default.
 
@@ -73,14 +73,15 @@ audio codebook slot.
 
 Text stays at its source frame and audio is delayed one frame. Controls describe
 the delayed audio: HEAR for user speech, SPEAK for assistant speech, WAIT for
-neither. Lexical BPE takes precedence, including on the final delayed user frame.
+neither. HEAR is retained through the final delayed user frame. Queued lexical
+BPE resumes on the following frame and otherwise takes precedence over controls.
 SPEAK below denotes the existing `<SPK>` tokenizer token. Example after delay:
 
 ```text
-Frame:           [  0  |  1   |   2   |   3    |   4   |    5     |    6    |    7     |    8     |    9    |  10   |  11  ]
-User audio:      [sine | sine | sine  | "Wait" | "one" | "second" | sine    | sine     | sine     | sine    | sine  | sine ]
-Assistant audio: [sine | sine | "I"   | sine   | sine  | sine     | "think" | "we"     | "should" | "leave" | "now" | sine ]
-Text:            [WAIT | [I]  | SPEAK | HEAR   | HEAR  | [think]  | [we]    | [should] | [leave]  | [now]   | SPEAK | WAIT ]
+Frame:           [0    |1    |2     |3     |4     |5        |6       |7       |8       |9        |10      |11    |12   ]
+User audio:      [sine |sine |sine  |"Wait"|"one" |"second" |sine    |sine    |sine    |sine     |sine    |sine  |sine ]
+Assistant audio: [sine |sine |"I"   |sine  |sine  |sine     |sine    |"think" |"we"    |"should" |"leave" |"now" |sine ]
+Text:            [WAIT |[I]  |SPEAK |HEAR  |HEAR  |HEAR     |[think] |[we]    |[should]|[leave]  |[now]   |SPEAK |WAIT ]
 ```
 
 This is a symbolic frame example. Real utterances use contiguous BPE starting

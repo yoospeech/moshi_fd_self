@@ -13,6 +13,12 @@
 
 ### Interleaving 과정
 
+![Residual codebook을 포함한 스트림 구성](natural_monologue_codebooks.png)
+
+FLM-Audio Figure 2의 표현을 참고하여 사용자·assistant 오디오를 각각 Q0(semantic), Q1~Q3(residual/acoustic)로 펼친 현재 기본 설정의 예시. 현재 코드는 모든 오디오 codebook에 동일한 1프레임 지연을 적용하며, codebook별 추가 계단식 지연은 적용하지 않음. codebook 개수는 설정 가능함.
+
+영어 예문은 assistant의 “I think we should leave now”와 사용자의 “Wait one second”로 구성함. 현재 코드의 프레임 배치를 따르되 영어 단어는 가상 BPE ID의 표시명으로 사용하며, 실제 tokenizer의 분할 결과나 단어별 음성 alignment를 의미하지 않음.
+
 ![Natural Monologue interleaving 과정](natural_monologue_interleaving.png)
 
 사용자 발화가 들어오면 assistant의 남은 텍스트·음성을 보관하고, 사용자 발화가 끝나면 이어서 배치하는 예시. 텍스트는 음성보다 한 프레임 앞서며, 제어 토큰은 지연 적용 후 들리는 음성 상태를 표현함. 그림은 이해를 위한 상징적 예시로, 실제 BPE 토큰과 음성 단어 경계가 일대일로 대응하지는 않음. 이 처리는 sine conditioning 옵션 활성화 시 적용됨.

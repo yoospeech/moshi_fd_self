@@ -30,9 +30,9 @@ exec /home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
   --depformer-heads 16 \
   --depformer-layers 6 \
   --depformer-ffn-dim 4096 \
-  --audio-loss-weight 0.1 \
   --text-loss-weight 1.0 \
-  --semantic-loss-weight 100 \
+  --audio-loss-weight 1.0 \
+  --semantic-loss-weight 2.0 \
   --audio-token-balance-alpha 1.0 \
   --text-padding-weight 0.5 \
   --audio-text-mask-probability 0.3 \
@@ -44,8 +44,6 @@ exec /home/ysw/Documents/anaconda3/envs/moshi_finetune/bin/python \
   --max-duration 200 \
   --min-text-tokens 5 \
   --valid-ratio 0.001 \
-  --valid-every 500 \
-  --valid-batches 54 \
   --log-every 50 \
   --save-every 500 \
   --log-timing \

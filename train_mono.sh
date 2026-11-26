@@ -17,7 +17,7 @@ python train_full_duplex.py \
   --depformer-layers 6 --depformer-ffn-dim 4096 \
   --text-padding-weight 0.5 --text-only-fraction 0.5 \
   --audio-text-mask-probability 0.3 \
-  --batch-size 4 --grad-accum 1 --steps 100000 \
+  --batch-size 2 --grad-accum 2 --steps 100000 \
   --learning-rate 2e-4 --temporal-learning-rate 2e-5 \
   --min-duration 5 --max-duration 100 --min-text-tokens 5 \
   --valid-ratio 0.05 --valid-every 500 --valid-batches 54 \

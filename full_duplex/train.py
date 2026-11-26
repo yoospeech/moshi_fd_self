@@ -224,6 +224,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-loss-weight", type=float, default=1.0)
     parser.add_argument("--semantic-loss-weight", type=float, default=100.0)
     parser.add_argument(
+        "--audio-token-balance-alpha", type=float, default=0.0,
+        help=(
+            "RQ-local inverse token-frequency exponent: 0 uses frame-mean CE, "
+            "1 uses macro-averaged CE over token IDs"
+        ),
+    )
+    parser.add_argument(
         "--text-padding-weight",
         type=float,
         default=0.5,
@@ -550,6 +557,8 @@ def run_training() -> None:
         raise ValueError("text-only-fraction must be between 0 and 1")
     if not 0.0 <= args.audio_text_mask_probability <= 1.0:
         raise ValueError("audio-text-mask-probability must be between 0 and 1")
+    if not 0.0 <= args.audio_token_balance_alpha <= 1.0:
+        raise ValueError("audio-token-balance-alpha must be between 0 and 1")
     if args.natural_monologue and args.task != "finetuning":
         raise ValueError("--natural-monologue requires --task finetuning")
     if args.enable_sine_conditioning and not args.natural_monologue:
@@ -629,6 +638,7 @@ def run_training() -> None:
         audio_loss_weight=args.audio_loss_weight,
         text_loss_weight=args.text_loss_weight,
         semantic_loss_weight=args.semantic_loss_weight,
+        audio_token_balance_alpha=args.audio_token_balance_alpha,
         text_padding_weight=args.text_padding_weight,
         wait_token_id=control_ids["wait"] if control_ids else None,
         spk_token_id=control_ids["spk"] if control_ids else None,
@@ -715,6 +725,7 @@ def run_training() -> None:
         config.text_loss_weight,
         config.audio_loss_weight,
         config.semantic_loss_weight,
+        config.audio_token_balance_alpha,
     )
     if world_size > 1:
         # The backbone's own token embedding is bypassed by inputs_embeds.

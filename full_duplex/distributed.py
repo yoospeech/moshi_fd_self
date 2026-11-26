@@ -39,7 +39,7 @@ class TrainingObjective(nn.Module):
 
     def __init__(
         self, model, padding_id, epad_id, control_ids, padding_weight, text_loss_weight,
-        audio_loss_weight, semantic_loss_weight
+        audio_loss_weight, semantic_loss_weight, audio_token_balance_alpha
     ):
         super().__init__()
         self.model = model
@@ -50,6 +50,7 @@ class TrainingObjective(nn.Module):
         self.text_loss_weight = text_loss_weight
         self.audio_loss_weight = audio_loss_weight
         self.semantic_loss_weight = semantic_loss_weight
+        self.audio_token_balance_alpha = audio_token_balance_alpha
 
     def forward(
         self, streams, text_targets=None, predict_audio=True,
@@ -70,5 +71,6 @@ class TrainingObjective(nn.Module):
             audio_accuracy_mask=audio_accuracy_mask,
             audio_loss_weight=self.audio_loss_weight,
             semantic_loss_weight=self.semantic_loss_weight,
+            audio_token_balance_alpha=self.audio_token_balance_alpha,
             text_targets=text_targets,
         )

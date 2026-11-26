@@ -39,6 +39,7 @@ class FullDuplexConfig:
     audio_loss_weight: float = 0.1
     text_loss_weight: float = 1.0
     semantic_loss_weight: float = 100.0
+    audio_token_balance_alpha: float = 0.0
     text_padding_weight: float = 0.5
     text_padding_id: int = 49152
     text_epad_id: int = 49153
@@ -289,6 +290,7 @@ def masked_multistream_loss(
     audio_loss_weight: float = 1.0,
     text_loss_weight: float = 1.0,
     semantic_loss_weight: float = 100.0,
+    audio_token_balance_alpha: float = 0.0,
     text_targets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute assistant text and feedback-audio CE losses."""
@@ -352,10 +354,24 @@ def masked_multistream_loss(
             mask = audio_mask[:, codebook]
             logits = audio_logits[:, codebook][mask].float()
             targets = audio_targets[:, codebook][mask]
-            codebook_loss = (
-                nn.functional.cross_entropy(logits, targets)
-                if targets.numel() else logits.sum() * 0.0
-            )
+            if targets.numel():
+                per_frame_loss = nn.functional.cross_entropy(
+                    logits, targets, reduction="none"
+                )
+                if audio_token_balance_alpha > 0:
+                    counts = torch.bincount(
+                        targets, minlength=logits.shape[-1]
+                    ).to(per_frame_loss.dtype)
+                    frame_weights = counts[targets].pow(
+                        -audio_token_balance_alpha
+                    )
+                    codebook_loss = (
+                        per_frame_loss * frame_weights
+                    ).sum() / frame_weights.sum()
+                else:
+                    codebook_loss = per_frame_loss.mean()
+            else:
+                codebook_loss = logits.sum() * 0.0
             per_codebook.append(codebook_loss)
             accuracy_selection = mask
             if audio_accuracy_mask is not None:

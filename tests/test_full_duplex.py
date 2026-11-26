@@ -25,6 +25,30 @@ from moshi.models.lm_utils import _delay_sequence
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_audio_macro_cross_entropy_averages_token_ids_equally(self):
+        streams = torch.tensor([[[10, 10, 10], [1, 1, 2]]])
+        text_logits = torch.zeros(1, 1, 3, 16)
+        text_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+        audio_logits = torch.tensor([[[
+            [0.0, 2.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.5],
+        ]]])
+        audio_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+        _, metrics = masked_multistream_loss(
+            text_logits, text_mask, streams,
+            audio_logits=audio_logits,
+            audio_mask=audio_mask,
+            audio_token_balance_alpha=1.0,
+        )
+        per_frame = torch.nn.functional.cross_entropy(
+            audio_logits[0, 0], streams[0, 1], reduction="none"
+        )
+        expected = (per_frame[:2].mean() + per_frame[2]) / 2
+        torch.testing.assert_close(
+            metrics["assistant_audio/rq/0_loss"], expected
+        )
+
     def test_audio_accuracy_excludes_sine_frames_but_loss_includes_them(self):
         streams = torch.tensor([[[10, 10, 10], [1, 2, 3]]])
         text_logits = torch.zeros(1, 1, 3, 16)

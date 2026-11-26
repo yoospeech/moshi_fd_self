@@ -285,6 +285,7 @@ def masked_multistream_loss(
     text_padding_weight: float = 0.5,
     audio_logits: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
+    audio_accuracy_mask: torch.Tensor | None = None,
     audio_loss_weight: float = 1.0,
     text_loss_weight: float = 1.0,
     semantic_loss_weight: float = 100.0,
@@ -340,6 +341,11 @@ def masked_multistream_loss(
     total = text_loss_weight * text_loss
     if audio_logits is not None and audio_mask is not None:
         audio_targets = streams[:, 1 : 1 + audio_logits.shape[1]]
+        if (
+            audio_accuracy_mask is not None
+            and audio_accuracy_mask.shape != streams[:, 0].shape
+        ):
+            raise ValueError("audio_accuracy_mask must have shape [batch, frames]")
         per_codebook = []
         accuracies = []
         for codebook in range(audio_logits.shape[1]):
@@ -351,9 +357,14 @@ def masked_multistream_loss(
                 if targets.numel() else logits.sum() * 0.0
             )
             per_codebook.append(codebook_loss)
+            accuracy_selection = mask
+            if audio_accuracy_mask is not None:
+                accuracy_selection = mask & audio_accuracy_mask
+            accuracy_logits = audio_logits[:, codebook][accuracy_selection].float()
+            accuracy_targets = audio_targets[:, codebook][accuracy_selection]
             accuracy = (
-                (logits.argmax(dim=-1) == targets).float().mean()
-                if targets.numel() else logits.new_zeros(())
+                (accuracy_logits.argmax(dim=-1) == accuracy_targets).float().mean()
+                if accuracy_targets.numel() else logits.new_zeros(())
             )
             accuracies.append(accuracy)
             metrics[f"assistant_audio/rq/{codebook}_loss"] = codebook_loss.detach()

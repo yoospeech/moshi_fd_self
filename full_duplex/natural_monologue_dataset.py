@@ -718,7 +718,7 @@ def collate_natural_monologue(batch: list[dict[str, Any]]) -> dict[str, Any]:
         assistant_waveforms[row, 0, :samples] = item["assistant_waveform"]
         assistant_text_tokens[row, :text_frames] = item["assistant_text_tokens"]
         text_only_tokens[row, :dense_tokens] = item["text_only_tokens"]
-    return {
+    result = {
         "waveforms": waveforms,
         "assistant_waveforms": assistant_waveforms,
         "assistant_text_tokens": assistant_text_tokens,
@@ -733,6 +733,17 @@ def collate_natural_monologue(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "ids": [item["id"] for item in batch],
         "languages": [item["language"] for item in batch],
     }
+    if any("sine_mask" in item for item in batch):
+        # True means that this source frame contains assistant content and is
+        # eligible for audio accuracy. Padded frames remain false.
+        accuracy_mask = torch.zeros(
+            len(batch), max_text_frames, dtype=torch.bool
+        )
+        for row, item in enumerate(batch):
+            frames = min(item["sine_mask"].numel(), max_text_frames)
+            accuracy_mask[row, :frames] = ~item["sine_mask"][:frames]
+        result["assistant_audio_accuracy_mask"] = accuracy_mask
+    return result
 
 
 def write_natural_monologue_debug(

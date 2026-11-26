@@ -405,6 +405,20 @@ def text_only_streams(
     return streams
 
 
+def audio_accuracy_mask(
+    batch: dict[str, object], streams: torch.Tensor
+) -> torch.Tensor | None:
+    """Align the dataset's non-sine frame mask with model target frames."""
+    source = batch.get("assistant_audio_accuracy_mask")
+    if source is None:
+        return None
+    source = source.to(streams.device, non_blocking=True)  # type: ignore[union-attr]
+    result = torch.zeros_like(streams[:, 0], dtype=torch.bool)
+    frames = min(source.shape[-1], result.shape[-1])
+    result[:, :frames] = source[:, :frames]
+    return result
+
+
 def mask_audio_batch_text(
     streams: torch.Tensor,
     *,
@@ -493,6 +507,7 @@ def evaluate(
                 text_padding_weight=config.text_padding_weight,
                 audio_logits=audio_logits,
                 audio_mask=audio_mask,
+                audio_accuracy_mask=audio_accuracy_mask(batch, streams),
                 audio_loss_weight=config.audio_loss_weight,
                 text_loss_weight=config.text_loss_weight,
                 semantic_loss_weight=config.semantic_loss_weight,
@@ -1032,7 +1047,12 @@ def run_training() -> None:
             sync_context = objective.no_sync() if world_size > 1 and not sync else contextlib.nullcontext()
             with sync_context:
                 with autocast:
-                    loss, metrics = objective(streams, text_targets, True)
+                    loss, metrics = objective(
+                        streams,
+                        text_targets,
+                        True,
+                        audio_accuracy_mask(batch, streams),
+                    )
                     scaled_loss = loss / accumulation_size
                 scaled_loss.backward()
 
@@ -1079,7 +1099,6 @@ def run_training() -> None:
                     f"text_samples={int((~acoustic_mask).sum())} loss={metrics['loss/total'].item():.4f} "
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
                     f"{audio_log}"
-                    f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
                     f"assistant_lexical_accuracy={metrics['assistant/lexical_accuracy'].item():.3f} "
                     f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f} "
                     f"{rq_log}",
@@ -1124,7 +1143,6 @@ def run_training() -> None:
                 )
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
-                    f"assistant_np_accuracy={valid_metrics['assistant/non_pad_accuracy']:.3f} "
                     f"assistant_lexical_accuracy={valid_metrics['assistant/lexical_accuracy']:.3f} "
                     f"assistant_all_accuracy={valid_metrics['assistant/accuracy']:.3f} "
                     f"{audio_log} {rq_log}",

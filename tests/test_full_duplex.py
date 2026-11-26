@@ -25,6 +25,30 @@ from moshi.models.lm_utils import _delay_sequence
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_audio_accuracy_excludes_sine_frames_but_loss_includes_them(self):
+        streams = torch.tensor([[[10, 10, 10], [1, 2, 3]]])
+        text_logits = torch.zeros(1, 1, 3, 16)
+        text_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+        audio_logits = torch.zeros(1, 1, 3, 8)
+        audio_logits[0, 0, 0, 1] = 1
+        audio_logits[0, 0, 1, 0] = 1  # Wrong, but this frame is sine.
+        audio_logits[0, 0, 2, 3] = 1
+        audio_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+        _, metrics = masked_multistream_loss(
+            text_logits, text_mask, streams,
+            audio_logits=audio_logits,
+            audio_mask=audio_mask,
+            audio_accuracy_mask=torch.tensor([[True, False, True]]),
+        )
+        self.assertEqual(metrics["assistant_rq_accuracy_1"].item(), 1.0)
+        self.assertEqual(metrics["assistant_audio/accuracy"].item(), 1.0)
+        expected_loss = torch.nn.functional.cross_entropy(
+            audio_logits[0, 0], streams[0, 1]
+        )
+        torch.testing.assert_close(
+            metrics["assistant_audio/rq/0_loss"], expected_loss
+        )
+
     def test_lexical_accuracy_excludes_padding_epad_and_control_tokens(self):
         targets = torch.tensor([[[10, 11, 12, 13, 14, 2, 3]]])
         logits = torch.zeros(1, 1, 7, 16)

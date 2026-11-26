@@ -285,6 +285,9 @@ class ModelTests(unittest.TestCase):
             )
             model = MoshiFullDuplexModel(cfg, device="cpu", dtype=torch.float32)
             model.eval()
+            pretrained = model.transformer.get_input_embeddings().weight
+            torch.testing.assert_close(model.text_emb.weight[:32], pretrained)
+            torch.testing.assert_close(model.text_linear.weight[:32], pretrained)
             torch.testing.assert_close(
                 model.delay_padding()[0, 1:, 0], torch.tensor([1, 2, 3, 4] * 2)
             )

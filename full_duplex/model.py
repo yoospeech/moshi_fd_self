@@ -157,11 +157,27 @@ class MoshiFullDuplexModel(LMModel):
         return torch.cat([text, audio], dim=1)
 
     def _seed_text_embeddings_from_temporal(self) -> None:
-        """Copy pretrained text embeddings while retaining DSM special rows."""
+        """Seed pretrained text input/output rows, retaining DSM special rows."""
         source = self.transformer.get_input_embeddings().weight
-        count = min(source.shape[0], self.text_emb.weight.shape[0])
+        input_count = min(source.shape[0], self.text_emb.weight.shape[0])
+        output_count = min(source.shape[0], self.text_linear.weight.shape[0])
         with torch.no_grad():
-            self.text_emb.weight[:count].copy_(source[:count].to(self.text_emb.weight))
+            self.text_emb.weight[:input_count].copy_(
+                source[:input_count].to(
+                    device=self.text_emb.weight.device,
+                    dtype=self.text_emb.weight.dtype,
+                )
+            )
+            # LFM3 ties its pretrained LM head to the input embeddings.  The
+            # DSM head has an independent parameter (and fewer rows than
+            # text_emb because the latter also carries the zero sentinel), so
+            # reproduce the tied initialization for the shared vocabulary.
+            self.text_linear.weight[:output_count].copy_(
+                source[:output_count].to(
+                    device=self.text_linear.weight.device,
+                    dtype=self.text_linear.weight.dtype,
+                )
+            )
 
     def forward_text(
         self,
